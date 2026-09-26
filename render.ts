@@ -167,7 +167,11 @@ class DepthBook {
       let d: any = null;
       try { d = JSON.parse(bodyText); } catch { /* ignore parse fail below */ }
       if (!r.ok || !d || (!d.bids && !d.asks)) {
-        this.lastError = `Snapshot fail — HTTP ${r.status}`;
+        this.lastError = r.status === 418
+          ? `Binance IP-ban (418) — order-book paused, auto-retry hoga`
+          : r.status === 429
+          ? `Binance rate-limit (429) — order-book paused, auto-retry hoga`
+          : `Snapshot fail — HTTP ${r.status}`;
         this.status = "error";
         this.retryTimer = setTimeout(() => this.loadSnapshot().then(() => this.connectUpstream()), 3000);
         return;
@@ -260,6 +264,11 @@ class DepthBook {
       bids: this.topRows(this.bidsMap, true),
       asks: this.topRows(this.asksMap, false),
       status: this.status,
+      // Frontend dropdown ke liye — status "error" ho to error text bhi
+      // saath bhejte hain (jaise "Binance IP-ban (418)..."), taaki app-side
+      // Order Book dropdown me exact wajah dikhe, sirf "live" na dikhe.
+      error: this.status === "error" ? this.lastError : null,
+      ip_banned: bnIpBanned,
       ts: nowMs(),
     });
     for (const c of this.clients) {
