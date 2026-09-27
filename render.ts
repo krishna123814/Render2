@@ -398,12 +398,12 @@ class DepthBook {
   }
   // REST se seedha depth snapshot poll karke bidsMap/asksMap replace karta
   // hai (diff-merge nahi — har poll ek fresh full snapshot hai, isliye
-  // gap/resync ka koi risk nahi). Har 3s mein 1 baar — WS PERMANENTLY
+  // gap/resync ka koi risk nahi). Har 1s mein 1 baar — WS PERMANENTLY
   // DISABLED (user request), yehi ek-matra data-path hai.
   startRestPoll() {
     this.usingRestPoll = true;
     this.source = "rest-poll";
-    const REST_POLL_MS = 3000;
+    const REST_POLL_MS = 1000;
     const poll = async () => {
       try {
         const r = await fetch(
