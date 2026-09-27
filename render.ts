@@ -126,6 +126,22 @@ class DepthBook {
   // hai, chahe koi browser client connect ho ya na ho.
   pinned = false;
 
+  // (NAYA — REST-poll fallback) Jab WS gateway (nbstream.binance.com) is
+  // network/region se hi unreachable ho (raw-probe confirmed: 404/1006,
+  // docs-verified sahi path ke baavjood — yeh WS-gateway-level ya geo-
+  // routing block hai, code ka bug nahi), to har retry par WS hang hote
+  // rehna client ko hamesha "error/no data" dikhata rehta hai jabki REST
+  // (eapi.binance.com) reliably kaam kar raha hai. FAIL_THRESHOLD_FOR_REST
+  // consecutive WS fails ke baad hum REST polling shuru kar dete hain taaki
+  // client ko kam se kam (thoda stale, ~REST_POLL_MS purana) order-book data
+  // milta rahe. WS reconnect background mein alag/dheeme cadence par chalta
+  // rehta hai — agar wo kabhi succeed ho jaaye (onopen fire ho), REST-poll
+  // turant band ho jaata hai aur live WS le leta hai.
+  usingRestPoll = false;
+  // deno-lint-ignore no-explicit-any
+  restPollTimer: any = null;
+  source: "ws" | "rest-poll" = "ws";
+
   // (PORTED from main.ts, 2026-09-27) Exact root-cause diagnostics. Purpose:
   // har failure ko do buckets mein clearly separate karna —
   //  (A) network/IP-level block: nbstream.binance.com se TCP/TLS handshake
@@ -155,7 +171,7 @@ class DepthBook {
   addClient(ws: WebSocket) {
     this.clients.add(ws);
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
-    if (!this.ws && !this.connecting) this.start();
+    if (!this.connecting && !this.usingRestPoll) this.start();
     if (!this.pushTimer) this.pushTimer = setInterval(() => this.pushToClients(), DEPTH_PUSH_MS);
   }
   removeClient(ws: WebSocket) {
@@ -165,15 +181,21 @@ class DepthBook {
     }
   }
   start() {
-    this.connecting = true;
+    // (2026-09-27) WS PERMANENTLY DISABLED (user request) — nbstream.binance.com
+    // WS gateway is region/network se unreachable hai (confirmed diagnostics).
+    // Ab seedha REST-poll (har REST_POLL_MS) use karte hain, koi WS attempt
+    // nahi hota — connectUpstream() ab kabhi call nahi hoti.
+    this.connecting = false;
     this.status = "connecting";
-    this.loadSnapshot().then(() => this.connectUpstream());
+    this.startRestPoll();
   }
   stop() {
     if (this.pushTimer) { clearInterval(this.pushTimer); this.pushTimer = null; }
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
     if (this.hsTimeoutTimer) { clearTimeout(this.hsTimeoutTimer); this.hsTimeoutTimer = null; }
+    if (this.restPollTimer) { clearInterval(this.restPollTimer); this.restPollTimer = null; }
+    this.usingRestPoll = false;
     try { this.ws?.close(); } catch { /* ignore */ }
     this.ws = null;
     this.connecting = false;
@@ -280,9 +302,11 @@ class DepthBook {
       this.openedAtTs = nowMs();
       if (this.hsTimeoutTimer) { clearTimeout(this.hsTimeoutTimer); this.hsTimeoutTimer = null; }
       this.status = "live";
+      this.source = "ws";
       this.lastError = null;
       this.lastErrorEventInfo = null;
       this.failCount = 0;
+      this.stopRestPoll();
     };
     ws.onmessage = (e: MessageEvent) => {
       if (this.ws !== ws) return;
@@ -368,8 +392,60 @@ class DepthBook {
   }
   scheduleRetry() {
     this.failCount++;
-    const delay = Math.min(1000 * 2 ** (this.failCount - 1), 15000);
-    this.retryTimer = setTimeout(() => this.connectUpstream(), delay);
+    // (2026-09-27) WS PERMANENTLY DISABLED — is function ka WS-retry hissa
+    // ab kabhi trigger nahi hota (connectUpstream() ko koi caller nahi
+    // bacha). REST-poll hi ab ek-matra data-path hai, dekho start().
+  }
+  // REST se seedha depth snapshot poll karke bidsMap/asksMap replace karta
+  // hai (diff-merge nahi — har poll ek fresh full snapshot hai, isliye
+  // gap/resync ka koi risk nahi). Har 3s mein 1 baar — WS PERMANENTLY
+  // DISABLED (user request), yehi ek-matra data-path hai.
+  startRestPoll() {
+    this.usingRestPoll = true;
+    this.source = "rest-poll";
+    const REST_POLL_MS = 3000;
+    const poll = async () => {
+      try {
+        const r = await fetch(
+          `${EAPI}/eapi/v1/depth?symbol=${encodeURIComponent(this.symbol)}&limit=20`,
+          { signal: AbortSignal.timeout(6000) },
+        );
+        const bodyText = await r.text();
+        if (r.status === 429 || r.status === 418) noteBnLimitEvent("/eapi/v1/depth (poll)", r, bodyText);
+        else if (r.ok) noteBnOk();
+        // deno-lint-ignore no-explicit-any
+        let d: any = null;
+        try { d = JSON.parse(bodyText); } catch { /* ignore */ }
+        if (r.ok && d && (d.bids || d.asks)) {
+          this.bidsMap = new Map(); this.asksMap = new Map();
+          depthApplySide(this.bidsMap, d.bids);
+          depthApplySide(this.asksMap, d.asks);
+          this.restOk = true;
+          this.restLastError = null;
+          this.restLastOkTs = nowMs();
+          this.lastUpdateTs = nowMs();
+          this.status = "live";
+          this.lastError =
+            `[REST-POLL] WS disabled hai (user request) — har ${REST_POLL_MS}ms mein REST se depth-snapshot aa raha hai.`;
+        } else {
+          this.restOk = false;
+          this.restLastError = `Poll fail — HTTP ${r.status}`;
+          this.status = "error";
+          this.lastError = `[REST-POLL] Poll fail — HTTP ${r.status}: ${this.restLastError}`;
+        }
+      } catch (e) {
+        this.restOk = false;
+        this.restLastError = `Poll error: ${e}`;
+        this.status = "error";
+        this.lastError = `[REST-POLL] Poll error: ${e}`;
+      }
+    };
+    poll(); // turant ek baar
+    this.restPollTimer = setInterval(poll, REST_POLL_MS);
+  }
+  stopRestPoll() {
+    if (this.restPollTimer) { clearInterval(this.restPollTimer); this.restPollTimer = null; }
+    this.usingRestPoll = false;
   }
   topRows(map: Map<string, number>, desc: boolean): DepthRow[] {
     const arr: DepthRow[] = [];
@@ -384,6 +460,7 @@ class DepthBook {
       bids: this.topRows(this.bidsMap, true),
       asks: this.topRows(this.asksMap, false),
       status: this.status,
+      source: this.source,  // "ws" (real-time) ya "rest-poll" (fallback, ~4s stale)
       // Frontend dropdown ke liye — status "error" ho to error text bhi
       // saath bhejte hain (jaise "Binance IP-ban (418)..."), taaki app-side
       // Order Book dropdown me exact wajah dikhe, sirf "live" na dikhe.
@@ -499,7 +576,7 @@ async function ensurePinnedAtm() {
   pinnedSymbol = picked.symbol;
   pinnedBook = getOrCreateDepthBook(picked.symbol);
   pinnedBook.pinned = true;
-  if (!pinnedBook.ws && !pinnedBook.connecting) pinnedBook.start();
+  if (!pinnedBook.connecting && !pinnedBook.usingRestPoll) pinnedBook.start();
   console.log(`[atm-pin] symbol=${picked.symbol} spot=${picked.spot} expiry=${picked.expiry}`);
 }
 
@@ -634,6 +711,8 @@ async function handleHttp(req: Request): Promise<Response> {
             last_close_reason: b.lastCloseReason,
             last_close_clean: b.lastCloseWasClean,
             fail_count: b.failCount,
+            source: b.source,
+            using_rest_poll_fallback: b.usingRestPoll,
           },
         })),
       }), { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
