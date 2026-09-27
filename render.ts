@@ -553,9 +553,20 @@ let pinLastPickExpiry: string | null = null;
 async function pickAtmCallSymbol(): Promise<{ symbol: string; symbol2: string | null; spot: number; expiry: string } | null> {
   try {
     const infoResp = await fetch(`${EAPI}/eapi/v1/exchangeInfo`, { signal: AbortSignal.timeout(8000) });
+    const infoBodyText = await infoResp.text();
+    // (FIX 2026-09-27) Pehle yahan noteBnLimitEvent/noteBnOk kabhi call nahi
+    // hota tha — isliye top-level "ip_banned" flag sirf depth-poll calls se
+    // update hota tha, exchangeInfo/index se nahi. Isse confusing dikhta
+    // tha: "ip_banned:false" jabki pick_error mein "HTTP 418" saaf dikh
+    // raha ho. Ab yahan bhi wahi shared tracking use karte hain taaki
+    // "ip_banned" hamesha SACH reflect kare, chahe ban kisi bhi endpoint
+    // (depth-poll, exchangeInfo, ya index) ki call se lagा ho.
+    if (infoResp.status === 429 || infoResp.status === 418) noteBnLimitEvent("/eapi/v1/exchangeInfo", infoResp, infoBodyText);
+    else if (infoResp.ok) noteBnOk();
     if (!infoResp.ok) { pinPickError = `exchangeInfo HTTP ${infoResp.status}`; return null; }
     // deno-lint-ignore no-explicit-any
-    const info: any = await infoResp.json();
+    let info: any = null;
+    try { info = JSON.parse(infoBodyText); } catch { pinPickError = "exchangeInfo response JSON parse fail"; return null; }
     // deno-lint-ignore no-explicit-any
     const btcCalls: any[] = (info.optionSymbols || []).filter(
       // deno-lint-ignore no-explicit-any
@@ -571,9 +582,13 @@ async function pickAtmCallSymbol(): Promise<{ symbol: string; symbol2: string | 
     const nearestExpiry = futureExpiries[0];
 
     const idxResp = await fetch(`${EAPI}/eapi/v1/index?underlying=BTCUSDT`, { signal: AbortSignal.timeout(8000) });
+    const idxBodyText = await idxResp.text();
+    if (idxResp.status === 429 || idxResp.status === 418) noteBnLimitEvent("/eapi/v1/index", idxResp, idxBodyText);
+    else if (idxResp.ok) noteBnOk();
     if (!idxResp.ok) { pinPickError = `index price HTTP ${idxResp.status}`; return null; }
     // deno-lint-ignore no-explicit-any
-    const idxData: any = await idxResp.json();
+    let idxData: any = null;
+    try { idxData = JSON.parse(idxBodyText); } catch { pinPickError = "index response JSON parse fail"; return null; }
     const spot = parseFloat(idxData.indexPrice);
     if (!Number.isFinite(spot)) { pinPickError = "index price parse fail — response mein indexPrice missing/invalid"; return null; }
 
