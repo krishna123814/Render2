@@ -195,7 +195,11 @@ class DepthBook {
     this.connecting = false;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(`wss://nbstream.binance.com/eoptions/ws/${this.symbol}@depth@100ms`);
+      // (FIX) "@depth@100ms" Binance Options ke liye documented stream nahi
+      // hai — "@depth1000" (diff-depth, U/u/pu wala) hi valid hai, jo isi
+      // class ke applyEvent() snapshot+diff merge logic ke saath match karta
+      // hai. main.ts mein bhi yehi fix laga hai (2026-09-27).
+      ws = new WebSocket(`wss://nbstream.binance.com/eoptions/ws/${this.symbol}@depth1000`);
     } catch {
       this.scheduleRetry();
       return;
