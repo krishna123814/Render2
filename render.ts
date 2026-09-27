@@ -166,6 +166,17 @@ class DepthBook {
   // deno-lint-ignore no-explicit-any
   hsTimeoutTimer: any = null;
 
+  // (NAYA 2026-09-27 — WS RE-ENABLED) Root-cause nikla: "@depth1000" koi
+  // valid Binance Options stream-name hi nahi hai (docs-verified) — isliye
+  // hamesha 404 aata tha, kisi IP-block ki wajah se nahi. Sahi documented
+  // diff-depth stream-names do hain: "@depth@100ms" aur "@depth@500ms".
+  // Dono try karte hain (alternate karke, har handshake-fail ke baad agla),
+  // taaki pata chale Binance is symbol ke liye kaunsa accept karta hai.
+  streamVariants: string[] = ["@depth@100ms", "@depth@500ms"];
+  streamVariantIdx = 0;
+  activeStreamVariant: string | null = null;   // is attempt mein try ho raha hai
+  workingStreamVariant: string | null = null;  // jo variant se onopen fire hua tha
+
   constructor(public symbol: string) {}
 
   addClient(ws: WebSocket) {
@@ -181,13 +192,16 @@ class DepthBook {
     }
   }
   start() {
-    // (2026-09-27) WS PERMANENTLY DISABLED (user request) — nbstream.binance.com
-    // WS gateway is region/network se unreachable hai (confirmed diagnostics).
-    // Ab seedha REST-poll (har REST_POLL_MS) use karte hain, koi WS attempt
-    // nahi hota — connectUpstream() ab kabhi call nahi hoti.
+    // (2026-09-27 — WS RE-ENABLED) Pehle "@depth1000" (invalid stream-name)
+    // ki wajah se hamesha 404 aata tha, isliye WS permanently disable karke
+    // sirf REST-poll rakha gaya tha. Ab sahi stream-names try karte hain.
+    // REST-poll turant bhi start karte hain (parallel safety-net) — jab tak
+    // WS handshake successful nahi hota, client ko REST se data milta rahega;
+    // WS khulte hi (onopen) REST-poll khud band ho jaata hai (dekho connectUpstream).
     this.connecting = false;
     this.status = "connecting";
     this.startRestPoll();
+    this.connectUpstream();
   }
   stop() {
     if (this.pushTimer) { clearInterval(this.pushTimer); this.pushTimer = null; }
@@ -258,11 +272,15 @@ class DepthBook {
     this.connectStartTs = nowMs();
     this.wsOpenedThisAttempt = false;
     let ws: WebSocket;
+    // Do valid stream-names mein se ek is attempt ke liye try karte hain.
+    const variant = this.streamVariants[this.streamVariantIdx % this.streamVariants.length];
+    this.activeStreamVariant = variant;
     try {
-      // "@depth@100ms" Binance Options ke liye documented stream nahi hai —
-      // "@depth1000" (diff-depth, U/u/pu wala) hi valid hai, jo isi class ke
-      // applyEvent() snapshot+diff merge logic ke saath match karta hai.
-      ws = new WebSocket(`wss://nbstream.binance.com/eoptions/ws/${this.symbol}@depth1000`);
+      // (FIX 2026-09-27) "@depth1000" invalid tha (docs mein exist hi nahi
+      // karta, isliye 404 aata tha). Sahi diff-depth stream-name:
+      // "<symbol>@depth@100ms" ya "<symbol>@depth@500ms" — dono U/u/pu
+      // wale format mein hote hain, isi class ke applyEvent() se match.
+      ws = new WebSocket(`wss://nbstream.binance.com/eoptions/ws/${this.symbol}${variant}`);
     } catch (e) {
       this.lastError = `Upstream WS connect threw (constructor level, DNS/URL issue ho sakta hai): ${e}`;
       this.status = "error";
@@ -299,6 +317,7 @@ class DepthBook {
       if (this.ws !== ws) return;
       this.wsOpenedThisAttempt = true;
       this.everConnectedOk = true;
+      this.workingStreamVariant = this.activeStreamVariant;
       this.openedAtTs = nowMs();
       if (this.hsTimeoutTimer) { clearTimeout(this.hsTimeoutTimer); this.hsTimeoutTimer = null; }
       this.status = "live";
@@ -340,6 +359,10 @@ class DepthBook {
         : "REST abhi test nahi hua";
 
       if (!this.wsOpenedThisAttempt) {
+        // Handshake kabhi complete hi nahi hua — agli baar doosra stream-
+        // name variant try karo (ho sakta hai is symbol/tier ke liye 100ms
+        // allowed na ho par 500ms ho, ya vice-versa).
+        this.streamVariantIdx++;
         // Handshake kabhi complete hi nahi hua (onopen fire hi nahi hua) —
         // yeh network/IP-block ka strong signal hai, kyunki ev.code = 0 ka
         // matlab hai koi application-level close-frame nahi mila, TCP-level
@@ -392,9 +415,14 @@ class DepthBook {
   }
   scheduleRetry() {
     this.failCount++;
-    // (2026-09-27) WS PERMANENTLY DISABLED — is function ka WS-retry hissa
-    // ab kabhi trigger nahi hota (connectUpstream() ko koi caller nahi
-    // bacha). REST-poll hi ab ek-matra data-path hai, dekho start().
+    // (2026-09-27 — WS RE-ENABLED) REST-poll safety-net ke saath WS retry —
+    // agar REST-poll kisi wajah se ruk gaya ho (jaise pehle band kar diya
+    // gaya tha), use wapas start karo taaki WS retry ke dauraan bhi data
+    // aata rahe. Exponential backoff (cap 15s) se WS dobara try karte hain.
+    if (!this.usingRestPoll) this.startRestPoll();
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    const delay = Math.min(500 * Math.pow(1.6, Math.min(this.failCount, 10)), 15000);
+    this.retryTimer = setTimeout(() => this.connectUpstream(), delay);
   }
   // REST se seedha depth snapshot poll karke bidsMap/asksMap replace karta
   // hai (diff-merge nahi — har poll ek fresh full snapshot hai, isliye
@@ -477,6 +505,8 @@ class DepthBook {
         last_close_reason: this.lastCloseReason,
         last_close_clean: this.lastCloseWasClean,
         fail_count: this.failCount,
+        stream_variant_tried: this.activeStreamVariant,
+        stream_variant_working: this.workingStreamVariant,
       },
       ts: nowMs(),
     });
@@ -738,6 +768,11 @@ async function handleHttp(req: Request): Promise<Response> {
             fail_count: b.failCount,
             source: b.source,
             using_rest_poll_fallback: b.usingRestPoll,
+            // (NAYA) Yehi batayega "kaun sa kaam kar raha hai" — agar
+            // stream_variant_working set hai, WS us variant se live hai;
+            // null ho to abhi tak sirf REST-poll hi chal raha hai.
+            stream_variant_tried: b.activeStreamVariant,
+            stream_variant_working: b.workingStreamVariant,
           },
         })),
       }), { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
@@ -759,17 +794,19 @@ async function handleHttp(req: Request): Promise<Response> {
 
     // (NAYA) Raw handshake diagnostic — Binance ke 400 response ka ASLI
     // status-line/headers/body dikhata hai (jo normal WebSocket API kabhi
-    // nahi deta). 3 tests ek saath: (A) bilkul bare connection, koi stream
+    // nahi deta). 4 tests ek saath: (A) bilkul bare connection, koi stream
     // nahi — sabse isolated test; (B) non-symbol stream (underlyingAsset
-    // @markPrice) — depth1000/option-symbol se alag category; (C) asli
-    // symbol jo depth mein fail ho raha hai (query ?symbol= ya current
-    // ATM-pinned symbol). GET (browser se bhi khol sakte ho seedha).
+    // @markPrice) — depth se alag category; (C)/(D) asli symbol ke dono
+    // valid depth stream-name variants (@depth@100ms, @depth@500ms) —
+    // (query ?symbol= ya current ATM-pinned symbol). GET (browser se bhi
+    // khol sakte ho seedha).
     if (url.pathname === "/diag/ws-raw") {
       const symbol = url.searchParams.get("symbol") || pinnedSymbol || "BTC-260928-85000-C";
-      const [bare, underlying, depth] = await Promise.all([
+      const [bare, underlying, depth100, depth500] = await Promise.all([
         rawWsHandshakeProbe("/eoptions/ws"),
         rawWsHandshakeProbe("/eoptions/ws/BTCUSDT@markPrice"),
-        rawWsHandshakeProbe(`/eoptions/ws/${symbol}@depth1000`),
+        rawWsHandshakeProbe(`/eoptions/ws/${symbol}@depth@100ms`),
+        rawWsHandshakeProbe(`/eoptions/ws/${symbol}@depth@500ms`),
       ]);
       return new Response(
         JSON.stringify(
@@ -780,7 +817,8 @@ async function handleHttp(req: Request): Promise<Response> {
             results: {
               bare_ws_no_stream: bare,
               underlying_markprice: underlying,
-              depth1000_symbol: depth,
+              depth_100ms_symbol: depth100,
+              depth_500ms_symbol: depth500,
             },
           },
           null,
