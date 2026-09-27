@@ -508,8 +508,92 @@ if (PIN_ATM_ON_BOOT) {
   setInterval(ensurePinnedAtm, PIN_REFRESH_MS);
 }
 
+// ── RAW WS-handshake diagnostic (manual TLS socket, NO Deno WebSocket API) ──
+// PURPOSE: Deno/browser ka built-in `WebSocket` API jab upgrade reject hoti
+// hai (400 jaisa), to sirf "Invalid status code 400" deta hai — Binance ka
+// ASLI response (status line, headers, body — jisme koi explanation ho
+// sakta hai) kabhi expose nahi karta (browsers/runtimes security ke liye
+// isse strip kar dete hain). Ye function raw TCP+TLS socket khol ke khud
+// HTTP upgrade request likhta hai aur raw response bytes padhta hai — taaki
+// Binance jo bhi bhej raha ho (chahe koi body ho ya na ho), hum wo dekh
+// sakein. Ye SIRF diagnostic ke liye hai — normal depth-flow (DepthBook)
+// isse bilkul alag hai aur touch nahi hota.
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+async function rawWsHandshakeProbe(path: string): Promise<{
+  ok: boolean;
+  status_line: string | null;
+  headers: string[];
+  body_snippet: string | null;
+  error: string | null;
+  ms: number;
+}> {
+  const t0 = nowMs();
+  let conn: Deno.TlsConn | null = null;
+  try {
+    conn = await Deno.connectTls({ hostname: "nbstream.binance.com", port: 443 });
+
+    // RFC 6455: Sec-WebSocket-Key 16 random raw bytes, base64-encoded.
+    const keyBytes = new Uint8Array(16);
+    crypto.getRandomValues(keyBytes);
+    let keyBin = "";
+    for (const b of keyBytes) keyBin += String.fromCharCode(b);
+    const wsKey = btoa(keyBin);
+
+    const req =
+      `GET ${path} HTTP/1.1\r\n` +
+      `Host: nbstream.binance.com\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${wsKey}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n` +
+      `User-Agent: render-depth-diag/1.0\r\n` +
+      `\r\n`;
+    await conn.write(new TextEncoder().encode(req));
+
+    // Response ke header-block (\r\n\r\n tak) padho, max ~5s ya ~4KB jo pehle aaye.
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const deadline = nowMs() + 5000;
+    while (total < 4096 && nowMs() < deadline) {
+      const buf = new Uint8Array(1024);
+      const remaining = Math.max(200, deadline - nowMs());
+      const n = await Promise.race([
+        conn.read(buf),
+        new Promise<null>((res) => setTimeout(() => res(null), remaining)),
+      ]);
+      if (n === null || n === 0) break;
+      chunks.push(buf.subarray(0, n));
+      total += n;
+      const soFar = new TextDecoder().decode(concatChunks(chunks));
+      if (soFar.includes("\r\n\r\n")) break;
+    }
+
+    const text = new TextDecoder().decode(concatChunks(chunks));
+    const [headerBlock, ...rest] = text.split("\r\n\r\n");
+    const lines = headerBlock.split("\r\n");
+    return {
+      ok: true,
+      status_line: lines[0] || null,
+      headers: lines.slice(1),
+      body_snippet: rest.join("\r\n\r\n").slice(0, 500) || null,
+      error: null,
+      ms: nowMs() - t0,
+    };
+  } catch (e) {
+    return { ok: false, status_line: null, headers: [], body_snippet: null, error: String(e), ms: nowMs() - t0 };
+  } finally {
+    try { conn?.close(); } catch { /* ignore */ }
+  }
+}
+
 // ── HTTP entrypoint ──────────────────────────────────────────────────────
-function handleHttp(req: Request): Response {
+async function handleHttp(req: Request): Promise<Response> {
   try {
     const url = new URL(req.url);
 
@@ -567,6 +651,39 @@ function handleHttp(req: Request): Response {
       socket.onclose = () => book.removeClient(socket);
       socket.onerror = () => book.removeClient(socket);
       return response;
+    }
+
+    // (NAYA) Raw handshake diagnostic — Binance ke 400 response ka ASLI
+    // status-line/headers/body dikhata hai (jo normal WebSocket API kabhi
+    // nahi deta). 3 tests ek saath: (A) bilkul bare connection, koi stream
+    // nahi — sabse isolated test; (B) non-symbol stream (underlyingAsset
+    // @markPrice) — depth1000/option-symbol se alag category; (C) asli
+    // symbol jo depth mein fail ho raha hai (query ?symbol= ya current
+    // ATM-pinned symbol). GET (browser se bhi khol sakte ho seedha).
+    if (url.pathname === "/diag/ws-raw") {
+      const symbol = url.searchParams.get("symbol") || pinnedSymbol || "BTC-260928-85000-C";
+      const [bare, underlying, depth] = await Promise.all([
+        rawWsHandshakeProbe("/eoptions/ws"),
+        rawWsHandshakeProbe("/eoptions/ws/BTCUSDT@markPrice"),
+        rawWsHandshakeProbe(`/eoptions/ws/${symbol}@depth1000`),
+      ]);
+      return new Response(
+        JSON.stringify(
+          {
+            ok: true,
+            tested_at: new Date().toISOString(),
+            tested_symbol: symbol,
+            results: {
+              bare_ws_no_stream: bare,
+              underlying_markprice: underlying,
+              depth1000_symbol: depth,
+            },
+          },
+          null,
+          2,
+        ),
+        { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+      );
     }
 
     return new Response("Not found — /ws/depth?symbol=... use karo", { status: 404 });
