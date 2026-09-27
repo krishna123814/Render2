@@ -539,18 +539,13 @@ const PIN_REFRESH_MS = 5 * 60 * 1000; // itni der mein dobara check — expiry r
 
 let pinnedSymbol: string | null = null;
 let pinnedBook: DepthBook | null = null;
-// (NAYA) Doosra nearby symbol — ATM ke baad sabse paas wala agla strike,
-// wahi expiry. Isko bhi ATM jaisa hi pin karke rakhte hain (har PIN_REFRESH_MS
-// mein recheck), taaki dono books hamesha REST_POLL_MS par live rahein.
-let pinnedSymbol2: string | null = null;
-let pinnedBook2: DepthBook | null = null;
 let pinPickError: string | null = null;
 let pinLastPickTs = 0;
 let pinLastPickSpot: number | null = null;
 let pinLastPickExpiry: string | null = null;
 
 // deno-lint-ignore no-explicit-any
-async function pickAtmCallSymbol(): Promise<{ symbol: string; symbol2: string | null; spot: number; expiry: string } | null> {
+async function pickAtmCallSymbol(): Promise<{ symbol: string; spot: number; expiry: string } | null> {
   try {
     const infoResp = await fetch(`${EAPI}/eapi/v1/exchangeInfo`, { signal: AbortSignal.timeout(8000) });
     const infoBodyText = await infoResp.text();
@@ -593,17 +588,15 @@ async function pickAtmCallSymbol(): Promise<{ symbol: string; symbol2: string | 
     if (!Number.isFinite(spot)) { pinPickError = "index price parse fail — response mein indexPrice missing/invalid"; return null; }
 
     const candidates = btcCalls.filter((s) => Number(s.expiryDate) === nearestExpiry);
-    // Spot ke sabse paas wale do strikes (same expiry) — sorted by |strike - spot|.
+    // Spot ke sabse paas wala ek hi strike (ATM) — sorted by |strike - spot|.
     // deno-lint-ignore no-explicit-any
     const sorted = [...candidates].sort(
       (a: any, b: any) => Math.abs(parseFloat(a.strikePrice) - spot) - Math.abs(parseFloat(b.strikePrice) - spot),
     );
     const best = sorted[0];
-    const second = sorted.length > 1 ? sorted[1] : null;
     pinPickError = null;
     return {
       symbol: best.symbol,
-      symbol2: second ? second.symbol : null,
       spot,
       expiry: new Date(nearestExpiry).toISOString(),
     };
@@ -620,7 +613,7 @@ async function ensurePinnedAtm() {
   pinLastPickSpot = picked.spot;
   pinLastPickExpiry = picked.expiry;
 
-  // ── Symbol #1 (ATM, spot ke sabse paas) ──────────────────────────────
+  // ── Symbol (ATM, spot ke sabse paas) ─────────────────────────────────
   if (!(pinnedSymbol === picked.symbol && pinnedBook && depthBooks.get(pinnedSymbol) === pinnedBook)) {
     // Symbol badal gaya (naya ATM strike ya expiry roll-over) — purane book
     // ko un-pin karo (agar koi real client use kar raha ho to wo apni normal
@@ -631,21 +624,6 @@ async function ensurePinnedAtm() {
     pinnedBook.pinned = true;
     if (!pinnedBook.connecting && !pinnedBook.usingRestPoll) pinnedBook.start();
     console.log(`[atm-pin] symbol=${picked.symbol} spot=${picked.spot} expiry=${picked.expiry}`);
-  }
-
-  // ── Symbol #2 (agla nearby strike, wahi expiry) ──────────────────────
-  if (!picked.symbol2) {
-    // Sirf ek hi strike mila (rare) — purana second-pin hata do agar tha.
-    if (pinnedBook2) { pinnedBook2.pinned = false; pinnedBook2 = null; pinnedSymbol2 = null; }
-    return;
-  }
-  if (!(pinnedSymbol2 === picked.symbol2 && pinnedBook2 && depthBooks.get(pinnedSymbol2) === pinnedBook2)) {
-    if (pinnedBook2) pinnedBook2.pinned = false;
-    pinnedSymbol2 = picked.symbol2;
-    pinnedBook2 = getOrCreateDepthBook(picked.symbol2);
-    pinnedBook2.pinned = true;
-    if (!pinnedBook2.connecting && !pinnedBook2.usingRestPoll) pinnedBook2.start();
-    console.log(`[atm-pin-2] symbol=${picked.symbol2} (nearby to ${picked.symbol})`);
   }
 }
 
@@ -758,7 +736,6 @@ async function handleHttp(req: Request): Promise<Response> {
         atm_pin: {
           enabled: PIN_ATM_ON_BOOT,
           symbol: pinnedSymbol,
-          symbol2: pinnedSymbol2,
           spot: pinLastPickSpot,
           expiry: pinLastPickExpiry,
           last_pick_age_ms: pinLastPickTs ? (t - pinLastPickTs) : null,
