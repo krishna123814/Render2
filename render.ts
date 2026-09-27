@@ -121,6 +121,34 @@ class DepthBook {
   lastUpdateTs = 0;
   status: "idle" | "connecting" | "live" | "error" = "idle";
   lastError: string | null = null;
+  // (NAYA) pinned=true wale book ko kabhi idle-stop nahi hota — boot-time
+  // ATM auto-pin (neeche dekho) isi flag se apna book "always on" rakhta
+  // hai, chahe koi browser client connect ho ya na ho.
+  pinned = false;
+
+  // (PORTED from main.ts, 2026-09-27) Exact root-cause diagnostics. Purpose:
+  // har failure ko do buckets mein clearly separate karna —
+  //  (A) network/IP-level block: nbstream.binance.com se TCP/TLS handshake
+  //      hi complete nahi ho raha (onopen kabhi fire nahi hota)
+  //  (B) stream-level drop: handshake ho gaya tha (onopen fire hua), phir
+  //      baad mein close hua — yeh alag problem hai (rate-limit/idle-timeout/
+  //      symbol issue), network block nahi.
+  // REST (eapi.binance.com) alag domain hai isliye uska apna success/fail
+  // track karte hain — agar REST OK hai par WS fail, to yeh confirm karta hai
+  // ki block specifically WS gateway (nbstream) ke liye hai.
+  restOk: boolean | null = null;         // null = abhi test nahi hua
+  restLastError: string | null = null;
+  restLastOkTs = 0;
+  wsOpenedThisAttempt = false;           // is attempt mein onopen fire hua?
+  everConnectedOk = false;               // process life mein kabhi bhi onopen fire hua?
+  connectStartTs = 0;
+  openedAtTs = 0;
+  lastCloseCode: number | null = null;
+  lastCloseReason = "";
+  lastCloseWasClean: boolean | null = null;
+  lastErrorEventInfo: string | null = null;
+  // deno-lint-ignore no-explicit-any
+  hsTimeoutTimer: any = null;
 
   constructor(public symbol: string) {}
 
@@ -132,7 +160,7 @@ class DepthBook {
   }
   removeClient(ws: WebSocket) {
     this.clients.delete(ws);
-    if (this.clients.size === 0 && !this.idleTimer) {
+    if (this.clients.size === 0 && !this.pinned && !this.idleTimer) {
       this.idleTimer = setTimeout(() => this.stop(), DEPTH_IDLE_STOP_MS);
     }
   }
@@ -145,6 +173,7 @@ class DepthBook {
     if (this.pushTimer) { clearInterval(this.pushTimer); this.pushTimer = null; }
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
+    if (this.hsTimeoutTimer) { clearTimeout(this.hsTimeoutTimer); this.hsTimeoutTimer = null; }
     try { this.ws?.close(); } catch { /* ignore */ }
     this.ws = null;
     this.connecting = false;
@@ -167,6 +196,12 @@ class DepthBook {
       let d: any = null;
       try { d = JSON.parse(bodyText); } catch { /* ignore parse fail below */ }
       if (!r.ok || !d || (!d.bids && !d.asks)) {
+        this.restOk = false;
+        this.restLastError = r.status === 418
+          ? `Binance IP-ban (418)`
+          : r.status === 429
+          ? `Binance rate-limit (429)`
+          : `Snapshot fail — HTTP ${r.status}`;
         this.lastError = r.status === 418
           ? `Binance IP-ban (418) — order-book paused, auto-retry hoga`
           : r.status === 429
@@ -176,6 +211,9 @@ class DepthBook {
         this.retryTimer = setTimeout(() => this.loadSnapshot().then(() => this.connectUpstream()), 3000);
         return;
       }
+      this.restOk = true;
+      this.restLastError = null;
+      this.restLastOkTs = nowMs();
       this.bidsMap = new Map(); this.asksMap = new Map();
       depthApplySide(this.bidsMap, d.bids);
       depthApplySide(this.asksMap, d.asks);
@@ -186,6 +224,8 @@ class DepthBook {
       this.lastUpdateTs = nowMs();
       for (const ev of buffered) this.applyEvent(ev);
     } catch (e) {
+      this.restOk = false;
+      this.restLastError = `Snapshot error: ${e}`;
       this.lastError = `Snapshot error: ${e}`;
       this.status = "error";
       this.retryTimer = setTimeout(() => this.loadSnapshot().then(() => this.connectUpstream()), 3000);
@@ -193,21 +233,55 @@ class DepthBook {
   }
   connectUpstream() {
     this.connecting = false;
+    this.connectStartTs = nowMs();
+    this.wsOpenedThisAttempt = false;
     let ws: WebSocket;
     try {
-      // (FIX) "@depth@100ms" Binance Options ke liye documented stream nahi
-      // hai — "@depth1000" (diff-depth, U/u/pu wala) hi valid hai, jo isi
-      // class ke applyEvent() snapshot+diff merge logic ke saath match karta
-      // hai. main.ts mein bhi yehi fix laga hai (2026-09-27).
+      // "@depth@100ms" Binance Options ke liye documented stream nahi hai —
+      // "@depth1000" (diff-depth, U/u/pu wala) hi valid hai, jo isi class ke
+      // applyEvent() snapshot+diff merge logic ke saath match karta hai.
       ws = new WebSocket(`wss://nbstream.binance.com/eoptions/ws/${this.symbol}@depth1000`);
-    } catch {
+    } catch (e) {
+      this.lastError = `Upstream WS connect threw (constructor level, DNS/URL issue ho sakta hai): ${e}`;
+      this.status = "error";
       this.scheduleRetry();
       return;
     }
     this.ws = ws;
+
+    // (PORTED from main.ts) Handshake timeout. Agar 8 second mein onopen
+    // nahi aaya, socket TCP/TLS level par hi atka hai — yeh application-level
+    // reject nahi hai, isliye is case ko alag se pehchanna zaroori hai
+    // (network/firewall/IP-block ka sabse strong signal).
+    if (this.hsTimeoutTimer) { clearTimeout(this.hsTimeoutTimer); this.hsTimeoutTimer = null; }
+    this.hsTimeoutTimer = setTimeout(() => {
+      if (this.ws !== ws || this.wsOpenedThisAttempt) return;
+      this.status = "error";
+      this.lastError =
+        `[HANDSHAKE-HANG] nbstream.binance.com se 8s mein bhi TCP/TLS connect complete nahi hua (onopen kabhi nahi aaya). ` +
+        `REST (eapi.binance.com) status: ${
+          this.restOk === true
+            ? "OK — " + Math.round((nowMs() - this.restLastOkTs) / 1000) + "s pehle kaam kiya"
+            : this.restOk === false
+            ? "yeh bhi FAIL — " + this.restLastError
+            : "abhi test nahi hua"
+        }. ` +
+        (this.restOk === true
+          ? "→ Diagnosis: REST (eapi.binance.com) chal raha hai lekin WS gateway (nbstream.binance.com) ka connect hang ho raha hai — yeh WS-specific block/firewall hai, general Render→Binance network issue nahi."
+          : "→ Diagnosis: REST bhi fail hai, isliye yeh general Render→Binance egress/network issue lagta hai, sirf WS ka nahi.") +
+        ` Retry ho raha hai…`;
+      try { ws.close(); } catch { /* ignore */ }
+    }, 8000);
+
     ws.onopen = () => {
       if (this.ws !== ws) return;
+      this.wsOpenedThisAttempt = true;
+      this.everConnectedOk = true;
+      this.openedAtTs = nowMs();
+      if (this.hsTimeoutTimer) { clearTimeout(this.hsTimeoutTimer); this.hsTimeoutTimer = null; }
       this.status = "live";
+      this.lastError = null;
+      this.lastErrorEventInfo = null;
       this.failCount = 0;
     };
     ws.onmessage = (e: MessageEvent) => {
@@ -220,11 +294,53 @@ class DepthBook {
       if (!this.snapshotReady) { this.buffer.push(d); return; }
       this.applyEvent(d);
     };
-    ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
-    ws.onclose = () => {
+    ws.onerror = (e: Event) => {
+      // deno-lint-ignore no-explicit-any
+      const ee = e as any;
+      this.lastErrorEventInfo = (ee && ee.message) ? String(ee.message) : `event type: ${e.type || "unknown"}`;
+      try { ws.close(); } catch { /* ignore */ }
+    };
+    ws.onclose = (ev: CloseEvent) => {
       if (this.ws !== ws) return;
+      if (this.hsTimeoutTimer) { clearTimeout(this.hsTimeoutTimer); this.hsTimeoutTimer = null; }
       this.ws = null;
       this.status = "error";
+      this.lastCloseCode = ev.code;
+      this.lastCloseReason = ev.reason || "";
+      this.lastCloseWasClean = ev.wasClean;
+
+      const restNote = this.restOk === true
+        ? "REST (eapi.binance.com) OK hai"
+        : this.restOk === false
+        ? "REST bhi fail — " + this.restLastError
+        : "REST abhi test nahi hua";
+
+      if (!this.wsOpenedThisAttempt) {
+        // Handshake kabhi complete hi nahi hua (onopen fire hi nahi hua) —
+        // yeh network/IP-block ka strong signal hai, kyunki ev.code = 0 ka
+        // matlab hai koi application-level close-frame nahi mila, TCP-level
+        // hi reset/refuse/drop hua.
+        const ms = nowMs() - this.connectStartTs;
+        this.lastError =
+          `[HANDSHAKE-FAIL] Upstream WS band ho gaya BEFORE onopen — ${ms}ms mein hi close (code ${ev.code}` +
+          (ev.reason ? `, reason: ${ev.reason}` : ", server ne koi reason nahi bheja") +
+          `, wasClean: ${ev.wasClean}). ${restNote}. ` +
+          (this.restOk === true
+            ? "→ Diagnosis: REST kaam kar raha hai par WS handshake reject/drop ho raha hai — yeh confirm karta hai ki block specifically nbstream.binance.com (WS gateway) ke liye hai, Binance ki taraf se ho sakta hai (cloud/datacenter IP block) ya Render ka outbound WS firewall."
+            : "→ Diagnosis: REST bhi fail ho raha hai — general network/egress block lagta hai, sirf WS ka nahi.") +
+          (this.lastErrorEventInfo ? ` onerror detail: ${this.lastErrorEventInfo}.` : "") +
+          ` Retry ho raha hai…`;
+      } else {
+        // Connect successful hua tha (onopen fire hua), phir baad mein drop
+        // hua — yeh ALAG problem hai: network block nahi (connection ek baar
+        // ban chuka tha), balki stream-level issue (idle timeout, rate-limit,
+        // ya Binance ne stream reset kiya).
+        const secOpen = this.openedAtTs ? Math.round((nowMs() - this.openedAtTs) / 1000) : null;
+        this.lastError =
+          `[STREAM-DROP] Upstream WS successfully connect hua tha, phir ${secOpen != null ? secOpen + "s baad" : ""} band ho gaya ` +
+          `(code ${ev.code}${ev.reason ? `, reason: ${ev.reason}` : ""}, wasClean: ${ev.wasClean}). ` +
+          `→ Diagnosis: yeh network/IP block NAHI hai (handshake pehle successful ho chuka tha) — likely idle-timeout, Binance-side stream reset, ya rate-limit hai. Retry ho raha hai…`;
+      }
       this.scheduleRetry();
     };
   }
@@ -273,6 +389,18 @@ class DepthBook {
       // Order Book dropdown me exact wajah dikhe, sirf "live" na dikhe.
       error: this.status === "error" ? this.lastError : null,
       ip_banned: bnIpBanned,
+      // (PORTED from main.ts) Structured diagnosis fields — chart.html iski
+      // wajah se ab ek chhota "Render ↔ Binance diagnosis" box dikha sakta
+      // hai, sirf ek lambi error-string parse kiye bina.
+      diag: {
+        rest_ok: this.restOk,
+        rest_last_error: this.restLastError,
+        ws_ever_opened: this.everConnectedOk,
+        last_close_code: this.lastCloseCode,
+        last_close_reason: this.lastCloseReason,
+        last_close_clean: this.lastCloseWasClean,
+        fail_count: this.failCount,
+      },
       ts: nowMs(),
     });
     for (const c of this.clients) {
@@ -286,6 +414,98 @@ function getOrCreateDepthBook(symbol: string): DepthBook {
   let b = depthBooks.get(symbol);
   if (!b) { b = new DepthBook(symbol); depthBooks.set(symbol, b); }
   return b;
+}
+
+// ── Boot-time ATM auto-pin (testing/debug convenience) ─────────────────────
+// PURPOSE: App khole/test kiye bina bhi is proxy ka WS khud check ho sake —
+// boot par REST se current ATM strike (nearest expiry, spot ke sabse
+// paas wala CALL strike) nikaal ke uska DepthBook "pinned" mark kar dete
+// hain, taaki koi bhi browser client connect na ho tab bhi uska upstream
+// WS chalta rahe. `/health` (ya `/`) khol ke seedha status/diag dekh sakte
+// ho — koi app/browser step chahiye hi nahi.
+// Agar koi real browser client isi symbol ke liye connect kare, to wahi
+// ek shared book use hoga (extra WS nahi khulega) — normal client-tracking
+// (clients.size) alag se chalti rehti hai, sirf idle-stop is book par
+// kabhi nahi lagta (dekho DepthBook.pinned).
+const PIN_ATM_ON_BOOT = (Deno.env.get("PIN_ATM_ON_BOOT") ?? "true").toLowerCase() !== "false";
+const PIN_REFRESH_MS = 5 * 60 * 1000; // itni der mein dobara check — expiry roll-over / naya ATM shift
+
+let pinnedSymbol: string | null = null;
+let pinnedBook: DepthBook | null = null;
+let pinPickError: string | null = null;
+let pinLastPickTs = 0;
+let pinLastPickSpot: number | null = null;
+let pinLastPickExpiry: string | null = null;
+
+// deno-lint-ignore no-explicit-any
+async function pickAtmCallSymbol(): Promise<{ symbol: string; spot: number; expiry: string } | null> {
+  try {
+    const infoResp = await fetch(`${EAPI}/eapi/v1/exchangeInfo`, { signal: AbortSignal.timeout(8000) });
+    if (!infoResp.ok) { pinPickError = `exchangeInfo HTTP ${infoResp.status}`; return null; }
+    // deno-lint-ignore no-explicit-any
+    const info: any = await infoResp.json();
+    // deno-lint-ignore no-explicit-any
+    const btcCalls: any[] = (info.optionSymbols || []).filter(
+      // deno-lint-ignore no-explicit-any
+      (s: any) => s.underlying === "BTCUSDT" && s.side === "CALL",
+    );
+    if (!btcCalls.length) { pinPickError = "Koi BTCUSDT CALL option symbol nahi mila (exchangeInfo response)"; return null; }
+
+    const nowT = nowMs();
+    const futureExpiries = [...new Set(btcCalls.map((s) => Number(s.expiryDate)))]
+      .filter((e) => e > nowT)
+      .sort((a, b) => a - b);
+    if (!futureExpiries.length) { pinPickError = "Koi future (non-expired) expiry nahi mila"; return null; }
+    const nearestExpiry = futureExpiries[0];
+
+    const idxResp = await fetch(`${EAPI}/eapi/v1/index?underlying=BTCUSDT`, { signal: AbortSignal.timeout(8000) });
+    if (!idxResp.ok) { pinPickError = `index price HTTP ${idxResp.status}`; return null; }
+    // deno-lint-ignore no-explicit-any
+    const idxData: any = await idxResp.json();
+    const spot = parseFloat(idxData.indexPrice);
+    if (!Number.isFinite(spot)) { pinPickError = "index price parse fail — response mein indexPrice missing/invalid"; return null; }
+
+    const candidates = btcCalls.filter((s) => Number(s.expiryDate) === nearestExpiry);
+    let best = candidates[0];
+    let bestDiff = Infinity;
+    for (const s of candidates) {
+      const strike = parseFloat(s.strikePrice);
+      const diff = Math.abs(strike - spot);
+      if (diff < bestDiff) { bestDiff = diff; best = s; }
+    }
+    pinPickError = null;
+    return { symbol: best.symbol, spot, expiry: new Date(nearestExpiry).toISOString() };
+  } catch (e) {
+    pinPickError = `pick error: ${e}`;
+    return null;
+  }
+}
+
+async function ensurePinnedAtm() {
+  const picked = await pickAtmCallSymbol();
+  pinLastPickTs = nowMs();
+  if (!picked) return;
+  pinLastPickSpot = picked.spot;
+  pinLastPickExpiry = picked.expiry;
+
+  if (pinnedSymbol === picked.symbol && pinnedBook && depthBooks.get(pinnedSymbol) === pinnedBook) {
+    return; // already pinned to same symbol — kuch karne ki zaroorat nahi
+  }
+  // Symbol badal gaya (naya ATM strike ya expiry roll-over) — purane book
+  // ko un-pin karo (agar koi real client use kar raha ho to wo apni normal
+  // idle-lifecycle se chalta rahega, warna khud idle-stop ho jaayega).
+  if (pinnedBook) pinnedBook.pinned = false;
+
+  pinnedSymbol = picked.symbol;
+  pinnedBook = getOrCreateDepthBook(picked.symbol);
+  pinnedBook.pinned = true;
+  if (!pinnedBook.ws && !pinnedBook.connecting) pinnedBook.start();
+  console.log(`[atm-pin] symbol=${picked.symbol} spot=${picked.spot} expiry=${picked.expiry}`);
+}
+
+if (PIN_ATM_ON_BOOT) {
+  ensurePinnedAtm();
+  setInterval(ensurePinnedAtm, PIN_REFRESH_MS);
 }
 
 // ── HTTP entrypoint ──────────────────────────────────────────────────────
@@ -302,12 +522,35 @@ function handleHttp(req: Request): Response {
         ip_banned: bnIpBanned,
         ip_ban_age_ms: bnIpBanned ? (t - bnIpBanSince) : null,
         last_limit_event: lastLimitEventReport(),
+        // (NAYA) Boot-time ATM auto-pin ka status — app khole bina hi test
+        // karne ke liye. Agar pin_error set hai, ATM-pick fail ho raha hai
+        // (exchangeInfo/index REST issue) — WS connect ka issue nahi.
+        atm_pin: {
+          enabled: PIN_ATM_ON_BOOT,
+          symbol: pinnedSymbol,
+          spot: pinLastPickSpot,
+          expiry: pinLastPickExpiry,
+          last_pick_age_ms: pinLastPickTs ? (t - pinLastPickTs) : null,
+          pick_error: pinPickError,
+        },
         depth_books: [...depthBooks.entries()].map(([sym, b]) => ({
           symbol: sym,
           status: b.status,
           clients: b.clients.size,
+          pinned: b.pinned,
           age_ms: b.lastUpdateTs ? t - b.lastUpdateTs : null,
           last_error: b.lastError,
+          // (PORTED from main.ts) exact diagnosis — REST vs WS, handshake
+          // ever complete hua ya nahi, aakhri close ka code/reason.
+          diag: {
+            rest_ok: b.restOk,
+            rest_last_error: b.restLastError,
+            ws_ever_opened: b.everConnectedOk,
+            last_close_code: b.lastCloseCode,
+            last_close_reason: b.lastCloseReason,
+            last_close_clean: b.lastCloseWasClean,
+            fail_count: b.failCount,
+          },
         })),
       }), { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
