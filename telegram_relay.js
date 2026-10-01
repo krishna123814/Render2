@@ -71,7 +71,7 @@ async function sendTelegram(text) {
 const server = http.createServer(async (req, res) => {
   try {
     const path = (req.url || "/").split("?")[0];
-    if (req.method === "GET" && (path === "/health" || path === "/")) return reply(res, 200, "ok");
+    if ((req.method === "GET" || req.method === "HEAD") && (path === "/health" || path === "/")) return reply(res, 200, "ok");
     if (req.method === "POST" && path === "/send") {
       if (!secretOk(req.headers["x-relay-secret"])) return reply(res, 401, { ok: false, msg: "unauthorized" });
       let data;
