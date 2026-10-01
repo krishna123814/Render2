@@ -1,0 +1,8 @@
+{
+  "name": "telegram-relay",
+  "version": "1.0.0",
+  "private": true,
+  "main": "telegram_relay.js",
+  "scripts": { "start": "node telegram_relay.js" },
+  "engines": { "node": ">=20" }
+}
