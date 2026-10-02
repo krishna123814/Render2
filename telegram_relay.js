@@ -5,11 +5,16 @@
 //   TELEGRAM_BOT_TOKEN  BotFather wala token
 //   TELEGRAM_CHAT_ID    userinfobot wala chat id
 //   RELAY_SECRET        koi lamba random password (min 16 chars); app.py me bhi wahi
+//   HF_PLAN_URL         (naya) HF Space ka URL, jaise https://krishan162627-trade.hf.space — "today plan" ke liye
+//   HF_ACCESS_TOKEN     (optional) sirf Space private ho to
 //   PORT                Render khud set karta hai
+//   RENDER_EXTERNAL_URL Render khud set karta hai (webhook apne aap isi se register hota hai)
 //
 // Endpoints:
 //   GET  /health        -> 200 "ok"
 //   POST /send          header X-Relay-Secret, body {"text": "..."}  -> {"ok":true}
+//   POST /tg            Telegram webhook (header secret se verify). Sirf TELEGRAM_CHAT_ID ka message sunta hai;
+//                       "plan" likhne par HF ke /api/plan_now se aaj ka plan lekar wapas Telegram par bhejta hai.
 
 const http = require("node:http");
 const crypto = require("node:crypto");
@@ -19,6 +24,11 @@ const PORT = Number(env("PORT")) || 10000;
 const TOKEN = env("TELEGRAM_BOT_TOKEN");
 const CHAT = env("TELEGRAM_CHAT_ID");
 const SECRET = env("RELAY_SECRET");
+const HF_URL = env("HF_PLAN_URL").replace(/\/+$/, "");
+const HF_ACCESS = env("HF_ACCESS_TOKEN");
+const PUBLIC_URL = env("RENDER_EXTERNAL_URL").replace(/\/+$/, "");
+// Telegram webhook ka secret header — RELAY_SECRET se bana hua (alag se kuch set nahi karna)
+const HOOK_SECRET = crypto.createHash("sha256").update("tg-hook:" + SECRET).digest("hex").slice(0, 48);
 const MAX_BODY = 16 * 1024;
 const MAX_TEXT = 4000;
 
@@ -68,6 +78,54 @@ async function sendTelegram(text) {
   return { ok: false, status: r.status, msg: String(j.description || "telegram error").slice(0, 200) };
 }
 
+const hashEq = (x, y) =>
+  crypto.timingSafeEqual(
+    crypto.createHash("sha256").update(String(x || "")).digest(),
+    crypto.createHash("sha256").update(String(y || "")).digest(),
+  );
+
+// "today plan" / "aaj ka plan" / "/plan" — par "kal ka plan" nahi
+const isPlanCmd = (t) => /\bplan\b/.test(t) && !/\b(kal|tomorrow)\b/.test(t);
+
+async function sendPlan() {
+  if (!HF_URL) return sendTelegram("⚠️ HF_PLAN_URL set nahi hai (relay ke Environment me daalo).");
+  try {
+    const headers = { "X-Relay-Secret": SECRET, "content-type": "application/json" };
+    if (HF_ACCESS) headers.authorization = `Bearer ${HF_ACCESS}`;
+    const r = await fetch(`${HF_URL}/api/plan_now`, { method: "POST", headers, body: "{}", signal: AbortSignal.timeout(70000) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok && typeof j.text === "string" && j.text) return sendTelegram(j.text);
+    return sendTelegram(`⚠️ Plan nahi mila (HF ${r.status}${j.msg ? ": " + j.msg : ""}).`);
+  } catch (e) {
+    return sendTelegram(`⚠️ Plan nahi mila: ${e instanceof Error ? e.name : "error"}`);
+  }
+}
+
+let lastUpdateId = 0;
+async function handleUpdate(u) {
+  if (!u || typeof u.update_id !== "number" || u.update_id <= lastUpdateId) return;   // Telegram retry se double na ho
+  lastUpdateId = u.update_id;
+  const m = u.message;
+  if (!m || typeof m.text !== "string" || String(m.chat && m.chat.id) !== CHAT) return;  // sirf aapka chat
+  if (isPlanCmd(m.text.toLowerCase())) await sendPlan();
+}
+
+async function registerWebhook() {
+  if (!PUBLIC_URL) return console.log(new Date().toISOString(), "RENDER_EXTERNAL_URL nahi — webhook register nahi kiya");
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: `${PUBLIC_URL}/tg`, secret_token: HOOK_SECRET, allowed_updates: ["message"] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const j = await r.json().catch(() => ({}));
+    console.log(new Date().toISOString(), "setWebhook:", r.status, j.ok ? "ok" : String(j.description || "fail"));
+  } catch (e) {
+    console.error(new Date().toISOString(), "setWebhook error:", (e instanceof Error ? e.message : String(e)).split(TOKEN).join("***"));
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const path = (req.url || "/").split("?")[0];
@@ -85,6 +143,18 @@ const server = http.createServer(async (req, res) => {
       const out = await sendTelegram(text);
       return reply(res, out.ok ? 200 : 502, out);
     }
+    if (req.method === "POST" && path === "/tg") {
+      if (!hashEq(req.headers["x-telegram-bot-api-secret-token"], HOOK_SECRET)) return reply(res, 401, { ok: false, msg: "unauthorized" });
+      let u;
+      try {
+        u = JSON.parse(await readBody(req));
+      } catch {
+        return reply(res, 400, { ok: false, msg: "bad json" });
+      }
+      reply(res, 200, { ok: true });   // Telegram ko turant 200, kaam peeche chalta hai
+      handleUpdate(u).catch((e) => console.error(new Date().toISOString(), "update error:", (e instanceof Error ? e.message : String(e)).split(TOKEN).join("***")));
+      return;
+    }
     return reply(res, 404, { ok: false, msg: "not found" });
   } catch (e) {
     const msg = (e instanceof Error ? e.message : String(e)).split(TOKEN).join("***");
@@ -93,4 +163,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(new Date().toISOString(), "telegram-relay listening on", PORT));
+server.listen(PORT, () => {
+  console.log(new Date().toISOString(), "telegram-relay listening on", PORT);
+  registerWebhook();
+});
