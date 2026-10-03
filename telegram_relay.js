@@ -5,7 +5,7 @@
 //   TELEGRAM_BOT_TOKEN  BotFather wala token
 //   TELEGRAM_CHAT_ID    userinfobot wala chat id
 //   RELAY_SECRET        koi lamba random password (min 16 chars); app.py me bhi wahi
-//   HF_PLAN_URL         (naya) HF Space ka URL, jaise https://krishan162627-trade.hf.space — "today plan" ke liye
+//   HF_PLAN_URL         HF Space ka URL, jaise https://krishan162627-trade.hf.space — "today plan" aur baaki commands (/api/cmd) ke liye
 //   HF_ACCESS_TOKEN     (optional) sirf Space private ho to
 //   PORT                Render khud set karta hai
 //   RENDER_EXTERNAL_URL Render khud set karta hai (webhook apne aap isi se register hota hai)
@@ -13,8 +13,10 @@
 // Endpoints:
 //   GET  /health        -> 200 "ok"
 //   POST /send          header X-Relay-Secret, body {"text": "..."}  -> {"ok":true}
-//   POST /tg            Telegram webhook (header secret se verify). Sirf TELEGRAM_CHAT_ID ka message sunta hai;
-//                       "plan" likhne par HF ke /api/plan_now se aaj ka plan lekar wapas Telegram par bhejta hai.
+//   POST /tg            Telegram webhook (header secret se verify). Sirf TELEGRAM_CHAT_ID ka message sunta hai.
+//                       MYENGINE-STEP-10A (2026-10-03): har message ka text + update_id HF ke POST /api/cmd par jaata hai
+//                       (header X-Relay-Secret); HF jo jawab text deta hai wahi Telegram par wapas jaata hai. Parsing sab HF (app.py) me —
+//                       relay patla hai. "today plan" bhi isi raste se (HF /api/cmd), purana /api/plan_now sirf fallback ke liye bacha hai.
 
 const http = require("node:http");
 const crypto = require("node:crypto");
@@ -84,8 +86,11 @@ const hashEq = (x, y) =>
     crypto.createHash("sha256").update(String(y || "")).digest(),
   );
 
-// "today plan" / "aaj ka plan" / "/plan" — par "kal ka plan" nahi
-const isPlanCmd = (t) => /\bplan\b/.test(t) && !/\b(kal|tomorrow)\b/.test(t);
+// MYENGINE-STEP-10A (2026-10-03): purana dheela match ("plan" shabd kahin bhi — "todo add plan banana" bhi plan bhej deta tha) ab
+// SIRF fallback hai (jab HF me /api/cmd abhi deploy nahi hua, 404) aur ab sirf poore exact phrases par ("plan", "today plan", "aaj ka plan", "/plan").
+// Asli parsing HF me hoti hai: pehle exact commands, "plan" sabse aakhir me, chhote message par.
+const PLAN_PHRASES = new Set(["plan", "today plan", "aaj ka plan", "today's plan", "todays plan"]);
+const isPlanFallback = (t) => PLAN_PHRASES.has(t.toLowerCase().replace(/^\//, "").replace(/@\w+$/, "").replace(/\s+/g, " ").trim());
 
 async function sendPlan() {
   if (!HF_URL) return sendTelegram("⚠️ HF_PLAN_URL set nahi hai (relay ke Environment me daalo).");
@@ -101,13 +106,38 @@ async function sendPlan() {
   }
 }
 
+// MYENGINE-STEP-10A (2026-10-03): message HF ke /api/cmd ko do, jawab Telegram par bhejo.
+// HF {ok, text, dup?}: dup ya khaali text = kuch mat bhejo. 404 (purana HF) par sirf chhota "plan" message fallback se chalega.
+async function sendCmd(text, updateId) {
+  if (!HF_URL) return sendTelegram("⚠️ HF_PLAN_URL set nahi hai (relay ke Environment me daalo).");
+  try {
+    const headers = { "X-Relay-Secret": SECRET, "content-type": "application/json" };
+    if (HF_ACCESS) headers.authorization = `Bearer ${HF_ACCESS}`;
+    const r = await fetch(`${HF_URL}/api/cmd`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: text.slice(0, 1000), update_id: updateId }),
+      signal: AbortSignal.timeout(70000),
+    });
+    if (r.status === 404 && isPlanFallback(text)) return sendPlan();   // HF abhi purana hai
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      if (j.dup || typeof j.text !== "string" || !j.text.trim()) return { ok: true };
+      return sendTelegram(j.text);
+    }
+    return sendTelegram(`⚠️ Command nahi chala (HF ${r.status}${j.msg ? ": " + j.msg : ""}).`);
+  } catch (e) {
+    return sendTelegram(`⚠️ Command nahi chala: ${e instanceof Error ? e.name : "error"}`);
+  }
+}
+
 let lastUpdateId = 0;
 async function handleUpdate(u) {
   if (!u || typeof u.update_id !== "number" || u.update_id <= lastUpdateId) return;   // Telegram retry se double na ho
   lastUpdateId = u.update_id;
   const m = u.message;
   if (!m || typeof m.text !== "string" || String(m.chat && m.chat.id) !== CHAT) return;  // sirf aapka chat
-  if (isPlanCmd(m.text.toLowerCase())) await sendPlan();
+  await sendCmd(m.text, u.update_id);
 }
 
 async function registerWebhook() {
