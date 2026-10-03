@@ -332,7 +332,7 @@ async function registerWebhook() {
 // Telegram ke "/" menu me commands (bot ke input ke paas). Description 3-256 chars.
 async function registerCommands() {
   const commands = [
-    ["plan", "Aaj ka plan"], ["todo", "Open To-Do list"], ["habit", "Aaj ke habits + streak"], ["routine", "Aaj ka routine"],
+    ["plan", "Aaj ka plan"], ["tick", "Pending kaam ki ✅/❌ checklist"], ["todo", "Open To-Do list"], ["habit", "Aaj ke habits + streak"], ["routine", "Aaj ka routine"],
     ["dip", "Dipanshu ke habits"], ["practice", "Practice sets"], ["rough", "Rough list"], ["info", "Info entries"],
     ["travel", "Trips"], ["balance", "Accounts balance"], ["find", "Dhoondho: find <shabd>"], ["status", "Server ki halat"], ["backup", "Abhi backup bhejo"], ["undo", "Aakhri change wapas"], ["help", "Saare commands"],
   ].map(([command, description]) => ({ command, description }));
