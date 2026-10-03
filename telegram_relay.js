@@ -12,7 +12,8 @@
 //
 // Endpoints:
 //   GET  /health        -> 200 "ok"
-//   POST /send          header X-Relay-Secret, body {"text": "..."}  -> {"ok":true}
+//   POST /send          header X-Relay-Secret, body {"text": "...", "reply_markup": {inline_keyboard}?}  -> {"ok":true}  (4000+ char ho to apne aap tukdon me)
+//   POST /senddoc       header X-Relay-Secret, body {"filename":"x.zip","b64":"...","caption":"..."} -> file Telegram par (backup ke liye, max ~12 MB)
 //   POST /tg            Telegram webhook (header secret se verify). Sirf TELEGRAM_CHAT_ID ka message sunta hai.
 //                       MYENGINE-STEP-10A (2026-10-03): har message ka text + update_id HF ke POST /api/cmd par jaata hai
 //                       (header X-Relay-Secret); HF jo jawab text deta hai wahi Telegram par wapas jaata hai. Parsing sab HF (app.py) me —
@@ -32,7 +33,9 @@ const PUBLIC_URL = env("RENDER_EXTERNAL_URL").replace(/\/+$/, "");
 // Telegram webhook ka secret header — RELAY_SECRET se bana hua (alag se kuch set nahi karna)
 const HOOK_SECRET = crypto.createHash("sha256").update("tg-hook:" + SECRET).digest("hex").slice(0, 48);
 const MAX_BODY = 16 * 1024;
+const MAX_DOC_BODY = 16 * 1024 * 1024;   // /senddoc (base64 zip)
 const MAX_TEXT = 4000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 if (!TOKEN || !CHAT || SECRET.length < 16) {
   console.error("TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID aur RELAY_SECRET (min 16 chars) set karo.");
@@ -51,13 +54,13 @@ const reply = (res, code, obj) => {
   res.end(body);
 };
 
-const readBody = (req) =>
+const readBody = (req, max = MAX_BODY) =>
   new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on("data", (c) => {
       size += c.length;
-      if (size > MAX_BODY) {
+      if (size > max) {
         reject(new Error("body too large"));
         req.destroy();
         return;
@@ -68,16 +71,87 @@ const readBody = (req) =>
     req.on("error", reject);
   });
 
-async function sendTelegram(text) {
-  const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT, text: text.slice(0, MAX_TEXT) }),
-    signal: AbortSignal.timeout(15000),
+// Telegram API call: 429 / 5xx / network error par 3 baar tak retry (retry_after ka dhyan rakhta hai).
+// makeBody() har try par naya body deta hai (FormData dobara use nahi hota).
+async function tgCall(method, makeBody, tries = 3) {
+  let last = { ok: false, status: 0, msg: "telegram error" };
+  for (let a = 0; a < tries; a++) {
+    try {
+      const b = makeBody();
+      const init = { method: "POST", signal: AbortSignal.timeout(25000) };
+      if (b instanceof FormData) init.body = b;
+      else {
+        init.headers = { "content-type": "application/json" };
+        init.body = JSON.stringify(b);
+      }
+      const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, init);
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.ok) return { ok: true, result: j.result };
+      last = { ok: false, status: r.status, msg: String(j.description || "telegram error").slice(0, 200) };
+      if (r.status === 429 || r.status >= 500) {
+        const wait = Math.min(10, Number(j.parameters && j.parameters.retry_after) || 1 + a);
+        await sleep(wait * 1000);
+        continue;
+      }
+      return last;
+    } catch (e) {
+      last = { ok: false, status: 0, msg: e instanceof Error ? e.name : "error" };
+      await sleep(1000 * (a + 1));
+    }
+  }
+  return last;
+}
+
+// lamba text newline par tukdon me (har tukda <= MAX_TEXT)
+function splitText(text) {
+  const out = [];
+  let rest = String(text);
+  while (rest.length > MAX_TEXT) {
+    let cut = rest.lastIndexOf("\n", MAX_TEXT);
+    if (cut < MAX_TEXT / 2) cut = MAX_TEXT;
+    out.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, "");
+  }
+  if (rest.length) out.push(rest);
+  return out.slice(0, 5);   // max 5 tukde
+}
+
+// inline keyboard sahi shape ka hai? ({inline_keyboard:[[{text, callback_data}]]}, <=100 buttons, callback_data <=64 bytes)
+function validMarkup(m) {
+  if (!m || typeof m !== "object" || !Array.isArray(m.inline_keyboard)) return false;
+  let n = 0;
+  for (const row of m.inline_keyboard) {
+    if (!Array.isArray(row) || !row.length) return false;
+    for (const b of row) {
+      n++;
+      if (!b || typeof b.text !== "string" || !b.text) return false;
+      if (typeof b.callback_data !== "string" || Buffer.byteLength(b.callback_data) > 64) return false;
+    }
+  }
+  return n > 0 && n <= 100;
+}
+
+async function sendTelegram(text, markup) {
+  const parts = splitText(text);
+  let out = { ok: true };
+  for (let i = 0; i < parts.length; i++) {
+    const body = { chat_id: CHAT, text: parts[i] };
+    if (markup && i === parts.length - 1) body.reply_markup = markup;
+    out = await tgCall("sendMessage", () => body);
+    if (!out.ok) break;
+  }
+  return out.ok ? { ok: true } : { ok: false, status: out.status, msg: out.msg };
+}
+
+async function sendDocument(filename, buf, caption) {
+  const out = await tgCall("sendDocument", () => {
+    const f = new FormData();
+    f.append("chat_id", CHAT);
+    if (caption) f.append("caption", String(caption).slice(0, 1000));
+    f.append("document", new Blob([buf], { type: "application/zip" }), filename);
+    return f;
   });
-  const j = await r.json().catch(() => ({}));
-  if (r.ok && j.ok) return { ok: true };
-  return { ok: false, status: r.status, msg: String(j.description || "telegram error").slice(0, 200) };
+  return out.ok ? { ok: true } : { ok: false, status: out.status, msg: out.msg };
 }
 
 const hashEq = (x, y) =>
@@ -106,28 +180,72 @@ async function sendPlan() {
   }
 }
 
-// MYENGINE-STEP-10A (2026-10-03): message HF ke /api/cmd ko do, jawab Telegram par bhejo.
-// HF {ok, text, dup?}: dup ya khaali text = kuch mat bhejo. 404 (purana HF) par sirf chhota "plan" message fallback se chalega.
-async function sendCmd(text, updateId) {
-  if (!HF_URL) return sendTelegram("⚠️ HF_PLAN_URL set nahi hai (relay ke Environment me daalo).");
+// HF ke /api/cmd ko text do. -> {ok, text, dup, status, msg}. 404 (purana HF) par fallback sirf "plan" ke liye (sendCmd me).
+async function callHF(text, updateId) {
+  const headers = { "X-Relay-Secret": SECRET, "content-type": "application/json" };
+  if (HF_ACCESS) headers.authorization = `Bearer ${HF_ACCESS}`;
   try {
-    const headers = { "X-Relay-Secret": SECRET, "content-type": "application/json" };
-    if (HF_ACCESS) headers.authorization = `Bearer ${HF_ACCESS}`;
     const r = await fetch(`${HF_URL}/api/cmd`, {
       method: "POST",
       headers,
       body: JSON.stringify({ text: text.slice(0, 1000), update_id: updateId }),
       signal: AbortSignal.timeout(70000),
     });
-    if (r.status === 404 && isPlanFallback(text)) return sendPlan();   // HF abhi purana hai
     const j = await r.json().catch(() => ({}));
-    if (r.ok && j.ok) {
-      if (j.dup || typeof j.text !== "string" || !j.text.trim()) return { ok: true };
-      return sendTelegram(j.text);
-    }
-    return sendTelegram(`⚠️ Command nahi chala (HF ${r.status}${j.msg ? ": " + j.msg : ""}).`);
+    return { ok: r.ok && j.ok === true, text: typeof j.text === "string" ? j.text : "", dup: !!j.dup, status: r.status, msg: j.msg ? String(j.msg) : "" };
   } catch (e) {
-    return sendTelegram(`⚠️ Command nahi chala: ${e instanceof Error ? e.name : "error"}`);
+    return { ok: false, text: "", dup: false, status: 0, msg: e instanceof Error ? e.name : "error" };
+  }
+}
+
+// MYENGINE-STEP-10A (2026-10-03): message HF ke /api/cmd ko do, jawab Telegram par bhejo.
+// HF {ok, text, dup?}: dup ya khaali text = kuch mat bhejo. 404 (purana HF) par sirf chhota "plan" message fallback se chalega.
+async function sendCmd(text, updateId) {
+  if (!HF_URL) return sendTelegram("⚠️ HF_PLAN_URL set nahi hai (relay ke Environment me daalo).");
+  const r = await callHF(text, updateId);
+  if (r.status === 404 && isPlanFallback(text)) return sendPlan();   // HF abhi purana hai
+  if (r.ok) {
+    if (r.dup || !r.text.trim()) return { ok: true };
+    return sendTelegram(r.text);
+  }
+  if (r.status === 0) return sendTelegram(`⚠️ Command nahi chala: ${r.msg}`);
+  return sendTelegram(`⚠️ Command nahi chala (HF ${r.status}${r.msg ? ": " + r.msg : ""}).`);
+}
+
+// ✅/❌ inline button dabana: HF ko "/cb k|id|date|s" bhejo, jawab chhote toast me, us item ki row keyboard se hata do.
+// Button ek ke baad ek (queue) chalte hain, taaki keyboard edit aapas me na takraayein.
+const kbState = new Map();   // message_id -> abhi ki keyboard rows
+let cbChain = Promise.resolve();
+
+async function handleCallback(u) {
+  const cq = u.callback_query;
+  const msg = cq.message;
+  if (!msg || !msg.chat || String(msg.chat.id) !== CHAT) {
+    await tgCall("answerCallbackQuery", () => ({ callback_query_id: cq.id }));
+    return;
+  }
+  const data = String(cq.data || "").slice(0, 64);
+  if (!HF_URL) {
+    await tgCall("answerCallbackQuery", () => ({ callback_query_id: cq.id, text: "HF_PLAN_URL set nahi" }));
+    return;
+  }
+  const r = await callHF("/cb " + data, u.update_id);
+  let toast = "";
+  if (r.ok) toast = r.dup ? "" : r.text.split("\n")[0];
+  else toast = `⚠️ HF ${r.status || r.msg || "error"}`;
+  await tgCall("answerCallbackQuery", () => ({ callback_query_id: cq.id, text: toast.slice(0, 190) }), 1);
+  if (!(r.ok && !r.dup && /^(✅|❌)/.test(r.text))) return;   // error / duplicate: keyboard waise hi rehne do
+  const key = data.split("|").slice(0, 3).join("|") + "|";
+  const cur = kbState.get(msg.message_id) || (msg.reply_markup && msg.reply_markup.inline_keyboard) || [];
+  const rows = cur.filter((row) => !row.some((b) => String(b.callback_data || "").startsWith(key)));
+  if (rows.length === cur.length) return;
+  if (!rows.length) {
+    kbState.delete(msg.message_id);
+    await tgCall("editMessageText", () => ({ chat_id: CHAT, message_id: msg.message_id, text: "✅ Raat ka hisaab complete — sab kaam mark ho gaye." }));
+  } else {
+    kbState.set(msg.message_id, rows);
+    while (kbState.size > 50) kbState.delete(kbState.keys().next().value);
+    await tgCall("editMessageReplyMarkup", () => ({ chat_id: CHAT, message_id: msg.message_id, reply_markup: { inline_keyboard: rows } }));
   }
 }
 
@@ -135,6 +253,10 @@ let lastUpdateId = 0;
 async function handleUpdate(u) {
   if (!u || typeof u.update_id !== "number" || u.update_id <= lastUpdateId) return;   // Telegram retry se double na ho
   lastUpdateId = u.update_id;
+  if (u.callback_query) {
+    cbChain = cbChain.then(() => handleCallback(u)).catch((e) => console.error(new Date().toISOString(), "callback error:", (e instanceof Error ? e.message : String(e)).split(TOKEN).join("***")));
+    return cbChain;
+  }
   const m = u.message;
   if (!m || typeof m.text !== "string" || String(m.chat && m.chat.id) !== CHAT) return;  // sirf aapka chat
   await sendCmd(m.text, u.update_id);
@@ -146,7 +268,7 @@ async function registerWebhook() {
     const r = await fetch(`https://api.telegram.org/bot${TOKEN}/setWebhook`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url: `${PUBLIC_URL}/tg`, secret_token: HOOK_SECRET, allowed_updates: ["message"] }),
+      body: JSON.stringify({ url: `${PUBLIC_URL}/tg`, secret_token: HOOK_SECRET, allowed_updates: ["message", "callback_query"] }),
       signal: AbortSignal.timeout(15000),
     });
     const j = await r.json().catch(() => ({}));
@@ -154,6 +276,17 @@ async function registerWebhook() {
   } catch (e) {
     console.error(new Date().toISOString(), "setWebhook error:", (e instanceof Error ? e.message : String(e)).split(TOKEN).join("***"));
   }
+}
+
+// Telegram ke "/" menu me commands (bot ke input ke paas). Description 3-256 chars.
+async function registerCommands() {
+  const commands = [
+    ["plan", "Aaj ka plan"], ["todo", "Open To-Do list"], ["habit", "Aaj ke habits + streak"], ["routine", "Aaj ka routine"],
+    ["dip", "Dipanshu ke habits"], ["practice", "Practice sets"], ["rough", "Rough list"], ["info", "Info entries"],
+    ["travel", "Trips"], ["balance", "Accounts balance"], ["backup", "Abhi backup bhejo"], ["undo", "Aakhri change wapas"], ["help", "Saare commands"],
+  ].map(([command, description]) => ({ command, description }));
+  const out = await tgCall("setMyCommands", () => ({ commands }));
+  console.log(new Date().toISOString(), "setMyCommands:", out.ok ? "ok" : out.msg);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -170,7 +303,24 @@ const server = http.createServer(async (req, res) => {
       }
       const text = typeof data?.text === "string" ? data.text.trim() : "";
       if (!text) return reply(res, 400, { ok: false, msg: "text khaali hai" });
-      const out = await sendTelegram(text);
+      const markup = data && data.reply_markup;
+      if (markup !== undefined && !validMarkup(markup)) return reply(res, 400, { ok: false, msg: "reply_markup galat" });
+      const out = await sendTelegram(text, markup);
+      return reply(res, out.ok ? 200 : 502, out);
+    }
+    if (req.method === "POST" && path === "/senddoc") {
+      if (!secretOk(req.headers["x-relay-secret"])) return reply(res, 401, { ok: false, msg: "unauthorized" });
+      let data;
+      try {
+        data = JSON.parse(await readBody(req, MAX_DOC_BODY));
+      } catch {
+        return reply(res, 400, { ok: false, msg: "bad json / bahut bada" });
+      }
+      const fname = typeof data?.filename === "string" ? data.filename.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) : "";
+      if (!fname || typeof data?.b64 !== "string" || !data.b64) return reply(res, 400, { ok: false, msg: "filename / b64 chahiye" });
+      const buf = Buffer.from(data.b64, "base64");
+      if (!buf.length) return reply(res, 400, { ok: false, msg: "file khaali hai" });
+      const out = await sendDocument(fname, buf, typeof data.caption === "string" ? data.caption : "");
       return reply(res, out.ok ? 200 : 502, out);
     }
     if (req.method === "POST" && path === "/tg") {
@@ -196,4 +346,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(new Date().toISOString(), "telegram-relay listening on", PORT);
   registerWebhook();
+  registerCommands();
 });
