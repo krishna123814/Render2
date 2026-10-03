@@ -190,7 +190,7 @@ async function callHF(text, updateId) {
     const r = await fetch(`${HF_URL}/api/cmd`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ text: text.slice(0, 1000), update_id: updateId }),
+      body: JSON.stringify({ text: text.slice(0, 3000), update_id: updateId }),
       signal: AbortSignal.timeout(70000),
     });
     const j = await r.json().catch(() => ({}));
@@ -334,7 +334,7 @@ async function registerCommands() {
   const commands = [
     ["plan", "Aaj ka plan"], ["todo", "Open To-Do list"], ["habit", "Aaj ke habits + streak"], ["routine", "Aaj ka routine"],
     ["dip", "Dipanshu ke habits"], ["practice", "Practice sets"], ["rough", "Rough list"], ["info", "Info entries"],
-    ["travel", "Trips"], ["balance", "Accounts balance"], ["backup", "Abhi backup bhejo"], ["undo", "Aakhri change wapas"], ["help", "Saare commands"],
+    ["travel", "Trips"], ["balance", "Accounts balance"], ["find", "Dhoondho: find <shabd>"], ["status", "Server ki halat"], ["backup", "Abhi backup bhejo"], ["undo", "Aakhri change wapas"], ["help", "Saare commands"],
   ].map(([command, description]) => ({ command, description }));
   const out = await tgCall("setMyCommands", () => ({ commands }));
   console.log(new Date().toISOString(), "setMyCommands:", out.ok ? "ok" : out.msg);

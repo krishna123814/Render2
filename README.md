@@ -34,3 +34,10 @@ curl -X POST https://<your-service>.onrender.com/send -H "X-Relay-Secret: <RELAY
 
 ## HF Space
 Sirf `app.py` replace karo (ab koi alag file nahi). Backup ke liye HF me persistent storage (`/data`) on rakho.
+
+## Naye Telegram commands (v1.3)
+- **Kai kaam ek saath:** pehli line `todo add` (ya `+`), neeche har line ek kaam. Har line me `| kal | high` chalega. Rough ke liye `rough add` ya `r`. Max 30. `undo` se sab ek saath wapas.
+- **Shortcuts:** `+ doodh lana | kal` = todo add, `r idea` = rough add.
+- **`find <shabd>`:** To-Do, Rough, Info, Travel sab me dhoondho.
+- **`status`:** server, background threads, Fyers expiry flag, aakhri backup, disk.
+- Relay ab 3000 akshar tak ka message HF ko bhejta hai (pehle 1000).
