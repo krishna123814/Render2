@@ -236,7 +236,7 @@ async function handleCallback(u) {
   if (r.ok) toast = r.dup ? "" : r.text.split("\n")[0];
   else toast = `⚠️ HF ${r.status || r.msg || "error"}`;
   await tgCall("answerCallbackQuery", () => ({ callback_query_id: cq.id, text: toast.slice(0, 190) }), 1);
-  if (!(r.ok && !r.dup && /^(✅|❌)/.test(r.text))) return;   // error / duplicate: keyboard waise hi rehne do
+  if (!(r.ok && !r.dup && /^(✅|❌|⏸)/.test(r.text))) return;   // error / duplicate: keyboard waise hi rehne do
   const key = data.split("|").slice(0, 3).join("|") + "|";
   const cur = kbState.get(msg.message_id) || (msg.reply_markup && msg.reply_markup.inline_keyboard) || [];
   const rows = cur.filter((row) => !row.some((b) => String(b.callback_data || "").startsWith(key)));
