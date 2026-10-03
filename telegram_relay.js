@@ -14,6 +14,8 @@
 //   GET  /health        -> 200 "ok"
 //   POST /send          header X-Relay-Secret, body {"text": "...", "reply_markup": {inline_keyboard}?}  -> {"ok":true}  (4000+ char ho to apne aap tukdon me)
 //   POST /senddoc       header X-Relay-Secret, body {"filename":"x.zip","b64":"...","caption":"..."} -> file Telegram par (backup ke liye, max ~12 MB)
+//   GET/POST /api/routine_resp   (v1.2) raat ki email wala ✅/❌ jawab-page HF se laakar dikhata hai (private Space ka gate relay paar karta hai,
+//                       HF_ACCESS_TOKEN se). Email ka link ab Render ka hota hai: HF Space me ROUTINE_BASE_URL = https://<service>.onrender.com
 //   POST /tg            Telegram webhook (header secret se verify). Sirf TELEGRAM_CHAT_ID ka message sunta hai.
 //                       MYENGINE-STEP-10A (2026-10-03): har message ka text + update_id HF ke POST /api/cmd par jaata hai
 //                       (header X-Relay-Secret); HF jo jawab text deta hai wahi Telegram par wapas jaata hai. Parsing sab HF (app.py) me —
@@ -249,6 +251,55 @@ async function handleCallback(u) {
   }
 }
 
+// ── (v1.2) Routine jawab-page proxy ────────────────────────────────────────
+// Email ka link Render ka hota hai (ROUTINE_BASE_URL). Browser ke paas HF ka login nahi hota, isliye private Space 404 deta tha.
+// Ab browser -> Render -> (HF_ACCESS_TOKEN ke saath) HF. SIRF /api/routine_resp, GET (page) + POST (submit). Page ka JS
+// location.pathname par POST karta hai, isliye wahi path yahan bhi chalta hai. Token (HMAC) ki jaanch HF karta hai, relay nahi.
+const ROUTINE_PATH = "/api/routine_resp";
+const MAX_ROUTINE_BODY = 256 * 1024;
+const routineErrPage = (msg) =>
+  '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+  '<body style="font:16px sans-serif;padding:24px;background:#131722;color:#d1d4dc">⚠️ ' + msg + "</body>";
+
+async function proxyRoutine(req, res) {
+  const isPost = req.method === "POST";
+  const fail = (code, msg) =>
+    isPost ? reply(res, code, { ok: false, msg }) : (res.writeHead(code, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }), res.end(routineErrPage(msg)));
+  if (!HF_URL) return fail(503, "HF_PLAN_URL set nahi hai (relay ke Environment me daalo).");
+  const headers = {};
+  if (HF_ACCESS) headers.authorization = `Bearer ${HF_ACCESS}`;
+  let url = `${HF_URL}${ROUTINE_PATH}`;
+  let body;
+  if (isPost) {
+    try {
+      body = await readBody(req, MAX_ROUTINE_BODY);
+    } catch {
+      return fail(413, "body bahut bada");
+    }
+    headers["content-type"] = "application/json";
+  } else {
+    // sirf d aur tok aage jaate hain (baaki query ignore)
+    const sp = new URL(req.url, "http://x").searchParams;
+    const q = new URLSearchParams();
+    for (const k of ["d", "tok"]) if (sp.has(k)) q.set(k, String(sp.get(k)).slice(0, 200));
+    url += "?" + q.toString();
+  }
+  try {
+    const r = await fetch(url, { method: isPost ? "POST" : "GET", headers, body, signal: AbortSignal.timeout(60000) });
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.writeHead(r.status, {
+      "content-type": r.headers.get("content-type") || (isPost ? "application/json" : "text/html; charset=utf-8"),
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer",
+      "content-length": buf.length,
+    });
+    res.end(buf);
+  } catch (e) {
+    console.error(new Date().toISOString(), "routine proxy error:", e instanceof Error ? e.name : "error");
+    return fail(502, "HF Space tak nahi pahunch paaya. Thodi der baad dobara link kholo.");
+  }
+}
+
 let lastUpdateId = 0;
 async function handleUpdate(u) {
   if (!u || typeof u.update_id !== "number" || u.update_id <= lastUpdateId) return;   // Telegram retry se double na ho
@@ -293,6 +344,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const path = (req.url || "/").split("?")[0];
     if ((req.method === "GET" || req.method === "HEAD") && (path === "/health" || path === "/")) return reply(res, 200, "ok");
+    if ((req.method === "GET" || req.method === "POST") && path === ROUTINE_PATH) return proxyRoutine(req, res);
     if (req.method === "POST" && path === "/send") {
       if (!secretOk(req.headers["x-relay-secret"])) return reply(res, 401, { ok: false, msg: "unauthorized" });
       let data;

@@ -17,6 +17,11 @@ HF Space se aaya message Telegram ko forward karta hai, aur Telegram me "today p
 - Bot menu ("/" button) ke commands start par apne aap register hote hain (`setMyCommands`).
 - Render par kuch naya set nahi karna; bas `telegram_relay.js` replace karke redeploy.
 
+## Naya (v1.2) — raat ki email ka link
+- `GET/POST /api/routine_resp`: ✅/❌ jawab-page ab Render se khulta hai (private HF Space ka 404 nahi aata). Relay `HF_ACCESS_TOKEN` lagakar HF se page laata hai; sirf yahi ek path.
+- **Karna kya hai:** relay redeploy karo, aur HF Space → Settings → Variables and secrets me `ROUTINE_BASE_URL` = `https://<tumhara-service>.onrender.com` (aakhir me `/` nahi). `HF_ACCESS_TOKEN` Render me set hona zaroori hai (Space private hai).
+- Test: browser me `https://<service>.onrender.com/api/routine_resp` kholo — "link galat ya expire" (403) page aaye to proxy chal raha hai.
+
 ## Telegram se plan
 Bot ko likho: `today plan`, `aaj ka plan`, `plan` ya `/plan`. ("kal ka plan" ignore hota hai.) Sirf `TELEGRAM_CHAT_ID` ka message sunta hai.
 
