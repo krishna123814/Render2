@@ -236,6 +236,12 @@ async function handleCallback(u) {
   if (r.ok) toast = r.dup ? "" : r.text.split("\n")[0];
   else toast = `⚠️ HF ${r.status || r.msg || "error"}`;
   await tgCall("answerCallbackQuery", () => ({ callback_query_id: cq.id, text: toast.slice(0, 190) }), 1);
+  // 💵 Money Manager (2026-10-04): category / sub chun liya ya cancel dabaya -> poora keyboard hata do (message waise hi rehta hai)
+  if (r.ok && !r.dup && /^(💵|❎)/.test(r.text)) {
+    kbState.delete(msg.message_id);
+    await tgCall("editMessageReplyMarkup", () => ({ chat_id: CHAT, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } }), 1);
+    return;
+  }
   if (!(r.ok && !r.dup && /^(✅|❌|⏸)/.test(r.text))) return;   // error / duplicate: keyboard waise hi rehne do
   const key = data.split("|").slice(0, 3).join("|") + "|";
   const cur = kbState.get(msg.message_id) || (msg.reply_markup && msg.reply_markup.inline_keyboard) || [];
@@ -334,7 +340,7 @@ async function registerCommands() {
   const commands = [
     ["plan", "Aaj ka plan"], ["tick", "Pending kaam ki ✅/❌ checklist"], ["todo", "Open To-Do list"], ["habit", "Aaj ke habits + streak"], ["routine", "Aaj ka routine"],
     ["dip", "Dipanshu ke habits"], ["practice", "Practice sets"], ["rough", "Rough list"], ["info", "Info entries"],
-    ["travel", "Trips"], ["balance", "Accounts balance"], ["find", "Dhoondho: find <shabd>"], ["status", "Server ki halat"], ["backup", "Abhi backup bhejo"], ["undo", "Aakhri change wapas"], ["help", "Saare commands"],
+    ["travel", "Trips"], ["balance", "Accounts balance"], ["find", "Dhoondho: find <shabd>"], ["status", "Server ki halat"], ["backup", "Abhi backup bhejo"], ["kharcha", "Kharcha jodo: kharcha 250 food/chai"], ["aay", "Income jodo: aay 5000 salary"], ["mm", "Money Manager: aaj ki entries"], ["undo", "Aakhri change wapas"], ["help", "Saare commands"],
   ].map(([command, description]) => ({ command, description }));
   const out = await tgCall("setMyCommands", () => ({ commands }));
   console.log(new Date().toISOString(), "setMyCommands:", out.ok ? "ok" : out.msg);
