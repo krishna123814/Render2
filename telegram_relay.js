@@ -39,6 +39,83 @@ const MAX_DOC_BODY = 16 * 1024 * 1024;   // /senddoc (base64 zip)
 const MAX_TEXT = 4000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ───────── Render log — is service (telegram-aib3) ka APNA ALAG log ─────────
+// replay-qda7 (main.ts) ka log "log" store me jaata hai; ye service "log_telegram" store me (HF: render_log_telegram.jsonl). Dono mix nahi hote.
+// Row format main.ts jaisa hi (kind: summary|fail|event|order, hop, src, endpoint, calls, fails, avg_ms, max_ms, status, msg, extra) + service:"telegram".
+// hop: "render>telegram" (Telegram API call) | "render>hf" (HF /api/cmd call) | "hf>render" (HF ne is relay ko call kiya: /send, /senddoc) | "render" (boot/shutdown).
+// Poori guide: RENDER_LOG_GUIDE.md
+// ENV (optional): HF_STORE_TOKEN = app.py wale RENDER_STORE_TOKEN jaisa; HF_STORE_URL (na ho to HF_PLAN_URL). Token na ho to log band (kuch nahi bigadta).
+// Rows me message ka text / token / chat id KABHI nahi jaata — sirf type, status, ms.
+const STORE_URL = (env("HF_STORE_URL") || HF_URL).replace(/\/+$/, "");
+const STORE_TOKEN = env("HF_STORE_TOKEN");
+const STORE_ON = !!(STORE_URL && STORE_TOKEN);
+const STARTED = Date.now();
+const rlogAgg = new Map();
+let rlogRows = [];
+let rlogPending = [];
+let rlogBusy = false;
+const minuteIso = () => { const d = new Date(); d.setSeconds(0, 0); return d.toISOString(); };
+function rlogCall(hop, src, endpoint, ms, ok, status, err) {
+  try {
+    const m = minuteIso();
+    const k = `s|${m}|${hop}|${src}`;
+    let a = rlogAgg.get(k);
+    if (!a) { a = { ts: m, kind: "summary", hop, src, endpoint: null, calls: 0, fails: 0, ms_sum: 0, ms_max: 0, status: null, msg: null }; rlogAgg.set(k, a); }
+    a.calls++; a.ms_sum += ms; if (ms > a.ms_max) a.ms_max = ms;
+    if (!ok) {
+      a.fails++;
+      const em = String(err == null ? "" : err).split(TOKEN || "\u0000").join("***").slice(0, 200);
+      const fk = `f|${m}|${hop}|${src}|${endpoint}|${status}|${em.slice(0, 80)}`;
+      let f = rlogAgg.get(fk);
+      if (!f) { f = { ts: m, kind: "fail", hop, src, endpoint, calls: 0, fails: 0, ms_sum: 0, ms_max: 0, status, msg: em }; rlogAgg.set(fk, f); }
+      f.calls++; f.fails++; f.ms_sum += ms; if (ms > f.ms_max) f.ms_max = ms;
+    }
+    if (rlogAgg.size > 4000) { const first = rlogAgg.keys().next().value; if (first !== undefined) rlogAgg.delete(first); }
+  } catch { /* log kabhi kaam nahi bigadta */ }
+}
+function rlogRow(kind, hop, src, endpoint, ok, msg, extra = null) {
+  try {
+    rlogRows.push({ ts: new Date().toISOString(), kind, hop, src, endpoint, calls: 1, fails: ok ? 0 : 1, avg_ms: null, max_ms: null, status: null, msg: String(msg).slice(0, 300), extra });
+    if (rlogRows.length > 2000) rlogRows.splice(0, rlogRows.length - 2000);
+  } catch { /* ignore */ }
+}
+function rlogFinalize(all) {
+  const rows = [];
+  const cur = minuteIso();
+  for (const [k, a] of rlogAgg) {
+    if (!all && a.ts >= cur) continue;
+    rows.push({ service: "telegram", ts: a.ts, kind: a.kind, hop: a.hop, src: a.src, endpoint: a.endpoint, calls: a.calls, fails: a.fails,
+      avg_ms: a.calls ? Math.round(a.ms_sum / a.calls) : null, max_ms: Math.round(a.ms_max), status: a.status, msg: a.msg, extra: null });
+    rlogAgg.delete(k);
+  }
+  for (const r of rlogRows.splice(0)) rows.push({ service: "telegram", ...r });
+  return rows;
+}
+async function rlogFlush(reason) {
+  const fresh = rlogFinalize(reason === "shutdown");
+  if (fresh.length) rlogPending.push(...fresh);
+  if (!STORE_ON) { rlogPending = []; return; }
+  if (!rlogPending.length || rlogBusy) return;
+  rlogBusy = true;
+  try {
+    const headers = { "x-store-token": STORE_TOKEN, "content-type": "application/json" };
+    if (HF_ACCESS) headers.authorization = `Bearer ${HF_ACCESS}`;
+    while (rlogPending.length) {
+      const batch = rlogPending.slice(0, 500);
+      const bid = crypto.createHash("sha1").update(JSON.stringify(batch)).digest("hex").slice(0, 20);
+      const r = await fetch(`${STORE_URL}/api/render_store/log_telegram`, { method: "POST", headers, body: JSON.stringify({ batch_id: bid, rows: batch }), signal: AbortSignal.timeout(reason === "shutdown" ? 4000 : 12000) });
+      const j = await r.json().catch(() => null);
+      if (!r.ok || !j || j.ok === false) { console.error(new Date().toISOString(), "render_log store fail:", r.status); break; }
+      rlogPending.splice(0, batch.length);
+    }
+  } catch (e) {
+    console.error(new Date().toISOString(), "render_log store error:", e instanceof Error ? e.name : "error");
+  } finally {
+    rlogBusy = false;
+    if (rlogPending.length > 5000) rlogPending.splice(0, rlogPending.length - 5000);
+  }
+}
+
 if (!TOKEN || !CHAT || SECRET.length < 16) {
   console.error("TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID aur RELAY_SECRET (min 16 chars) set karo.");
   process.exit(1);
@@ -75,7 +152,7 @@ const readBody = (req, max = MAX_BODY) =>
 
 // Telegram API call: 429 / 5xx / network error par 3 baar tak retry (retry_after ka dhyan rakhta hai).
 // makeBody() har try par naya body deta hai (FormData dobara use nahi hota).
-async function tgCall(method, makeBody, tries = 3) {
+async function tgCallInner(method, makeBody, tries = 3) {
   let last = { ok: false, status: 0, msg: "telegram error" };
   for (let a = 0; a < tries; a++) {
     try {
@@ -102,6 +179,13 @@ async function tgCall(method, makeBody, tries = 3) {
     }
   }
   return last;
+}
+
+async function tgCall(method, makeBody, tries = 3) {
+  const t0 = Date.now();
+  const out = await tgCallInner(method, makeBody, tries);
+  rlogCall("render>telegram", method, "/" + method, Date.now() - t0, !!out.ok, out.status || null, out.ok ? null : out.msg);
+  return out;
 }
 
 // lamba text newline par tukdon me (har tukda <= MAX_TEXT)
@@ -183,7 +267,7 @@ async function sendPlan() {
 }
 
 // HF ke /api/cmd ko text do. -> {ok, text, dup, status, msg}. 404 (purana HF) par fallback sirf "plan" ke liye (sendCmd me).
-async function callHF(text, updateId) {
+async function callHFInner(text, updateId) {
   const headers = { "X-Relay-Secret": SECRET, "content-type": "application/json" };
   if (HF_ACCESS) headers.authorization = `Bearer ${HF_ACCESS}`;
   try {
@@ -198,6 +282,13 @@ async function callHF(text, updateId) {
   } catch (e) {
     return { ok: false, text: "", dup: false, status: 0, msg: e instanceof Error ? e.name : "error" };
   }
+}
+
+async function callHF(text, updateId) {
+  const t0 = Date.now();
+  const r = await callHFInner(text, updateId);
+  rlogCall("render>hf", "cmd", "/api/cmd", Date.now() - t0, !!r.ok, r.status || null, r.ok ? null : (r.msg || "hf cmd fail"));
+  return r;
 }
 
 // MYENGINE-STEP-10A (2026-10-03): message HF ke /api/cmd ko do, jawab Telegram par bhejo.
@@ -352,7 +443,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.method === "GET" || req.method === "HEAD") && (path === "/health" || path === "/")) return reply(res, 200, "ok");
     if ((req.method === "GET" || req.method === "POST") && path === ROUTINE_PATH) return proxyRoutine(req, res);
     if (req.method === "POST" && path === "/send") {
-      if (!secretOk(req.headers["x-relay-secret"])) return reply(res, 401, { ok: false, msg: "unauthorized" });
+      if (!secretOk(req.headers["x-relay-secret"])) { rlogRow("event", "hf>render", "send", "/send", false, "401 unauthorized (galat X-Relay-Secret)"); return reply(res, 401, { ok: false, msg: "unauthorized" }); }
       let data;
       try {
         data = JSON.parse(await readBody(req));
@@ -364,6 +455,7 @@ const server = http.createServer(async (req, res) => {
       const markup = data && data.reply_markup;
       if (markup !== undefined && !validMarkup(markup)) return reply(res, 400, { ok: false, msg: "reply_markup galat" });
       const out = await sendTelegram(text, markup);
+      if (!out.ok) rlogRow("event", "hf>render", "send", "/send", false, "502 telegram send fail: " + String(out.msg || "").slice(0, 150));
       return reply(res, out.ok ? 200 : 502, out);
     }
     if (req.method === "POST" && path === "/senddoc") {
@@ -379,6 +471,7 @@ const server = http.createServer(async (req, res) => {
       const buf = Buffer.from(data.b64, "base64");
       if (!buf.length) return reply(res, 400, { ok: false, msg: "file khaali hai" });
       const out = await sendDocument(fname, buf, typeof data.caption === "string" ? data.caption : "");
+      if (!out.ok) rlogRow("event", "hf>render", "senddoc", "/senddoc", false, "502 backup bhejna fail: " + String(out.msg || "").slice(0, 150));
       return reply(res, out.ok ? 200 : 502, out);
     }
     if (req.method === "POST" && path === "/tg") {
@@ -405,4 +498,19 @@ server.listen(PORT, () => {
   console.log(new Date().toISOString(), "telegram-relay listening on", PORT);
   registerWebhook();
   registerCommands();
+  rlogRow("event", "render", "boot", null, true, `Telegram relay start | store=${STORE_ON ? "on" : "off"}`);
+  if (!STORE_ON) console.log(new Date().toISOString(), "render_log: HF_STORE_TOKEN set nahi — log band");
+  setInterval(() => { rlogFlush("tick"); }, 60000);
+  setTimeout(() => { rlogFlush("tick"); }, 5000);
 });
+
+let shuttingDown = false;
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    rlogRow("event", "render", "shutdown", null, true, `Telegram relay band ho raha hai (${sig}) | uptime ${Math.round((Date.now() - STARTED) / 1000)}s`);
+    try { await rlogFlush("shutdown"); } catch { /* ignore */ }
+    process.exit(0);
+  });
+}
