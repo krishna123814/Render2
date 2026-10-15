@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Swipe down se notification panel kholne ke liye -->
+    <uses-permission android:name="android.permission.EXPAND_STATUS_BAR" />
+    <!-- Long-press menu se uninstall ke liye -->
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
     <!-- Android 11+: installed apps ki list dekhne ke liye -->
     <queries>
         <intent>
@@ -23,11 +28,17 @@
             android:clearTaskOnLaunch="true"
             android:stateNotNeeded="true"
             android:resumeWhilePausing="true"
+            android:windowSoftInputMode="stateHidden|adjustResize"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.HOME" />
                 <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <!-- App icon: isse kholne par "default home app" chunne ka dialog aata hai -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
     </application>

@@ -14,7 +14,7 @@ android {
 
         val vcProp = (project.findProperty("vc") as String?)?.toIntOrNull()
         versionCode = vcProp ?: (System.currentTimeMillis() / 60000L).toInt()
-        versionName = "1.0"
+        versionName = "2.0"
     }
 
     // Keystore GitHub Secrets se build ke waqt app/lion-release.jks me banti hai (repo me nahi).
