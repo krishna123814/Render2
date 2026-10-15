@@ -1,0 +1,87 @@
+name: Unzip and Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "SimpleLauncher.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip ko extract karo
+        run: |
+          test -f SimpleLauncher.zip || { echo "SimpleLauncher.zip repo ke root me nahi mili"; exit 1; }
+          rm -rf _project && mkdir _project
+          unzip -q SimpleLauncher.zip -d _project
+          if [ ! -d _project/app ]; then
+            inner=$(find _project -maxdepth 2 -type d -name app | head -1 | xargs dirname)
+            test -n "$inner" || { echo "zip me app/ folder nahi mila"; exit 1; }
+            mv "$inner" _project_inner && rm -rf _project && mv _project_inner _project
+          fi
+          rm -rf _project/.github
+          cp -r _project/. .
+          rm -rf _project
+
+      - name: Extract ki hui files repo me commit karo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Extract SimpleLauncher project" || echo "kuch naya nahi mila"
+          git push || echo "push nahi hua, build phir bhi chalega"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Keystore Secret se banao
+        env:
+          KS_B64: ${{ secrets.LION_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > app/lion-release.jks
+            echo "Keystore ban gayi"
+          else
+            echo "::warning::LION_KEYSTORE_BASE64 secret nahi mila. APK debug key se sign hogi, update-bina-uninstall kaam nahi karega."
+          fi
+
+      - name: Debug APK banao
+        env:
+          LION_STORE_PASSWORD: ${{ secrets.LION_STORE_PASSWORD }}
+          LION_KEY_ALIAS: ${{ secrets.LION_KEY_ALIAS }}
+          LION_KEY_PASSWORD: ${{ secrets.LION_KEY_PASSWORD }}
+        run: |
+          VC=$(( $(date +%s) / 60 ))
+          echo "VC=$VC" >> "$GITHUB_ENV"
+          gradle assembleDebug --no-daemon -Pvc=$VC
+          cp app/build/outputs/apk/debug/app-debug.apk LionLauncher.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SimpleLauncher-debug-apk
+          path: LionLauncher.apk
+
+      - name: GitHub Release banao
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "launcher-$VC" LionLauncher.apk \
+            --title "Lion Launcher build $VC" \
+            --notes "Auto build $VC" \
+            --latest
+          # sirf latest 5 release rakho
+          gh release list --limit 100 --json tagName --jq '[.[] | select(.tagName | startswith("launcher-"))] | .[5:][].tagName' | while read -r t; do
+            [ -n "$t" ] && gh release delete "$t" --cleanup-tag -y || true
+          done
